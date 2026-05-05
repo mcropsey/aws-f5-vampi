@@ -1,6 +1,5 @@
 *** BELOW Instructions on creating via Cloud formation template ***
 *** The attached word doc allows you do do this via cli instead ***
-
 ******** NOTE **********
 
 RHEL 9 AMI (ami-035032ea878eca201) — Red Hat periodically releases new RHEL 9 images. This one works today. If you run this 6 months from now, re-check with:
