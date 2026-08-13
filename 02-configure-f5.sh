@@ -36,7 +36,10 @@ SSH_OPTS=(-i "$KEY_FILE"
 # remote command string IS a tmsh command. Older/modified images land in bash;
 # TMSH_PREFIX absorbs that difference.
 TMSH_PREFIX=""
-tm() { ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "${TMSH_PREFIX}$1" 2>&1; }
+tm() { ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "${TMSH_PREFIX}$1" </dev/null 2>&1; }
+# </dev/null on every SSH call is intentional: without it, bash scripts piped
+# into this script (e.g. printf 'pass\npass\n' | ./02-configure-f5.sh) have
+# their stdin consumed by the SSH wait-loop before the 'read' password prompts.
 
 # ── 1. wait for the BIG-IP to finish booting ─────────────────────────────────
 hd "Waiting for BIG-IP at ${F5_MGMT_IP}"
@@ -44,12 +47,12 @@ say "First boot takes 5–10 minutes (licensing + provisioning). Be patient."
 
 booted=0
 for i in $(seq 1 60); do
-  if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "show sys version" 2>&1); then
+  if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "show sys version" </dev/null 2>&1); then
     if printf '%s' "$out" | grep -qi 'BIG-IP\|Sys::Version'; then
       booted=1; break
     fi
     # Shell is bash, not tmsh
-    if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "tmsh -c 'show sys version'" 2>&1) \
+    if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "tmsh -c 'show sys version'" </dev/null 2>&1) \
        && printf '%s' "$out" | grep -qi 'BIG-IP\|Sys::Version'; then
       TMSH_PREFIX="tmsh -c "; booted=1; break
     fi
@@ -96,10 +99,14 @@ fi
 # Success is decided by re-listing the object, not by parsing the create
 # output — BIG-IP emits numbered *warnings* (e.g. traffic-group-local-only on
 # a standalone device) that look exactly like numbered errors.
+#
+# Pattern note: most objects return "01020036:3: The requested X was not found."
+# but 'list net route <name>' returns "route not found: <name>" — no "was".
+# Matching 'not found' (not 'was not found') covers both forms.
 exists() {
   local out
   out=$(tm "$1" || true)
-  [[ -n "$out" ]] && ! printf '%s' "$out" | grep -qi 'was not found\|010200[0-9]'
+  [[ -n "$out" ]] && ! printf '%s' "$out" | grep -qi 'not found\|010200[0-9]'
 }
 
 ensure() {
@@ -124,6 +131,7 @@ tm "modify sys global-settings hostname bigip1.mcropsey.lab" >/dev/null && ok "H
 tm "modify sys ntp servers add { pool.ntp.org }"              >/dev/null || true
 tm "modify sys dns name-servers add { 8.8.8.8 8.8.4.4 }"      >/dev/null || true
 ok "NTP + DNS set"
+tm "modify sys global-settings gui-setup disabled"            >/dev/null && ok "GUI setup wizard disabled"
 
 # ── 5. VLANs ─────────────────────────────────────────────────────────────────
 # eth1 -> interface 1.1 (external, 10.0.5.0/24)
@@ -203,9 +211,11 @@ else
   tm "show ltm pool vampi-pool members"
   say ""
   warn "Most common causes, in order:"
-  say  "  1. VAmPI container isn't running   → ssh ec2-user@${VAMPI_PUBLIC_IP}; sudo podman ps"
-  say  "  2. VAmPI SG missing the 10.0.6.0/24 rule on port 5000"
-  say  "  3. Container not started with --network host (pasta drops VPC traffic)"
+  say  "  1. TMM route to VAmPI subnet missing — verify with 'list net route to-vampi'"
+  say  "     If absent: create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1"
+  say  "  2. VAmPI container isn't running   → ssh ec2-user@${VAMPI_PUBLIC_IP}; sudo podman ps"
+  say  "  3. VAmPI SG missing the 10.0.6.0/24 rule on port 5000"
+  say  "  4. Container not started with --network host (pasta drops VPC traffic)"
   say  "  Test the path from the BIG-IP directly:"
   say  "     ssh -i $KEY_FILE admin@${F5_MGMT_IP}"
   say  "     run util bash -c 'curl -sv --interface 10.0.6.10 http://${VAMPI_PRIVATE_IP}:5000/'"

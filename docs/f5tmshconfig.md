@@ -39,7 +39,16 @@ modify auth user admin password "<your-password>"
 
 ---
 
-## 3 — Create VLANs
+## 3 — Disable GUI Setup Wizard
+Without this the TMUI opens to an interactive setup screen instead of the dashboard.
+```bash
+modify sys global-settings gui-setup disabled
+save sys config
+```
+
+---
+
+## 4 — Create VLANs
 ```bash
 create net vlan external interfaces add { 1.1 { untagged } }
 create net vlan internal interfaces add { 1.2 { untagged } }
@@ -47,7 +56,7 @@ create net vlan internal interfaces add { 1.2 { untagged } }
 
 ---
 
-## 4 — Create Self IPs
+## 5 — Create Self IPs
 ```bash
 create net self self-ext address 10.0.5.10/24 vlan external allow-service none
 create net self self-int address 10.0.6.10/24 vlan internal allow-service default
@@ -55,21 +64,21 @@ create net self self-int address 10.0.6.10/24 vlan internal allow-service defaul
 
 ---
 
-## 5 — Create Health Monitor
+## 6 — Create Health Monitor
 ```bash
 create ltm monitor http vampi-monitor interval 5 timeout 16 send "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" recv "200 OK"
 ```
 
 ---
 
-## 6 — Create Pool
+## 7 — Create Pool
 ```bash
 create ltm pool vampi-pool monitor vampi-monitor members add { $VAMPI_PRIVATE_IP:5000 { address $VAMPI_PRIVATE_IP } }
 ```
 
 ---
 
-## 7 — Create Virtual Server
+## 8 — Create Virtual Server
 ```bash
 create ltm virtual vampi-vs destination 10.0.5.10:80 ip-protocol tcp pool vampi-pool profiles add { http { } } source-address-translation { type automap }
 ```
@@ -77,13 +86,21 @@ create ltm virtual vampi-vs destination 10.0.5.10:80 ip-protocol tcp pool vampi-
 
 ---
 
-## 8 — Routes
+## 9 — Routes
 
 **8a. Static route to the VAmPI subnet.** Required because the F5 internal
 subnet (10.0.6.0/24) has no route to VAmPI (10.0.1.0/24) by default.
 ```bash
 create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1
 ```
+
+To confirm it exists:
+```bash
+list net route to-vampi
+```
+> Note: `list net route <name>` returns `"route not found: <name>"` when absent
+> — not the standard `"was not found"` message used for VLANs, self IPs, and
+> other objects. Keep this in mind when scripting existence checks.
 
 **8b. Default gateway.** Required for return traffic to internet clients. DHCP
 on the external interface often creates this for you — check before adding it,
@@ -100,14 +117,14 @@ create net route default-gw network default gw 10.0.5.1
 
 ---
 
-## 9 — Save Config
+## 10 — Save Config
 ```bash
 save sys config
 ```
 
 ---
 
-## 10 — Verify Pool is Green
+## 11 — Verify Pool is Green
 ```bash
 show ltm pool vampi-pool members
 ```
@@ -120,14 +137,14 @@ run util bash -c "curl -sv --interface 10.0.6.10 http://$VAMPI_PRIVATE_IP:5000/"
 
 ---
 
-## 11 — Test VIP from Laptop
+## 12 — Test VIP from Laptop
 ```bash
 curl http://$F5_VIP_IP/
 ```
 
 ---
 
-## 12 — Initialize VAmPI Database
+## 13 — Initialize VAmPI Database
 ```bash
 curl http://$F5_VIP_IP/createdb
 ```

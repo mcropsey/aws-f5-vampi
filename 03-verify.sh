@@ -62,7 +62,7 @@ if [[ -f "$KEY_FILE" ]]; then
   hd "Pool status (via SSH)"
   ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes \
-      "admin@${F5_MGMT_IP}" "show ltm pool vampi-pool members" 2>&1 | sed 's/^/  /'
+      "admin@${F5_MGMT_IP}" "show ltm pool vampi-pool members" </dev/null 2>&1 | sed 's/^/  /'
 fi
 
 hd "Result"

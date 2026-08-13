@@ -105,6 +105,22 @@ emits numbered *warnings* that look identical to numbered errors — the
 `traffic-group-local-only` message on virtual server creation is the famous
 one. Every `create` in `02` is confirmed with a follow-up `list`.
 
+**`exists()` now matches both BIG-IP "not found" error formats.** The original
+`exists()` helper checked for `"was not found"` to detect a missing object, but
+`list net route <name>` returns `"route not found: <name>"` — no `"was"`. The
+mismatch caused the route existence check to return true when the route was
+absent, so `ensure` never called `create`. Both TMM routes (VAmPI subnet and
+default gateway) were silently skipped, which is why the pool member showed
+offline despite all other config being correct. The pattern now matches `"not
+found"`, which covers both error formats.
+
+**SSH calls no longer consume piped stdin before password prompts.** The BIG-IP
+boot-wait loop runs multiple SSH connections before the `read` password prompt.
+When the script is driven non-interactively (e.g.
+`printf 'pass\npass\n' | ./02-configure-f5.sh`), those SSH connections drain
+the pipe before `read` can see it, causing an immediate exit. `</dev/null` is
+now set on every SSH call in the script.
+
 **Everything is re-runnable.** `02` checks each object before creating it, so
 if the pool member isn't green you can fix the cause and run it again without
 tearing anything down.
@@ -115,9 +131,10 @@ tearing anything down.
 
 **Pool member won't go green.** In order of likelihood:
 
-1. VAmPI container isn't running — `ssh -i ~/.ssh/mcropsey-key.pem ec2-user@<VAMPI_IP>`, then `sudo podman ps -a` and `sudo podman logs vampi`.
-2. The container didn't start with `--network host`. Podman's default pasta networking silently drops VPC-to-VPC traffic — this is the single most common cause of a red pool in this lab.
-3. Test the path from the BIG-IP itself:
+1. TMM route to VAmPI subnet is missing. Confirm with `list net route to-vampi` on the BIG-IP. If absent, create it: `create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1`. Check for the default gateway too: `list net route` — you need a `default` entry; if not, `create net route default-gw network default gw 10.0.5.1`.
+2. VAmPI container isn't running — `ssh -i ~/.ssh/mcropsey-key.pem ec2-user@<VAMPI_IP>`, then `sudo podman ps -a` and `sudo podman logs vampi`.
+3. The container didn't start with `--network host`. Podman's default pasta networking silently drops VPC-to-VPC traffic.
+4. Test the path from the BIG-IP itself:
    ```
    ssh -i ~/.ssh/mcropsey-key.pem admin@<F5_MGMT_IP>
    run util bash -c 'curl -sv --interface 10.0.6.10 http://<VAMPI_PRIVATE_IP>:5000/'
