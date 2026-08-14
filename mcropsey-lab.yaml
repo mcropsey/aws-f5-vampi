@@ -279,6 +279,11 @@ Resources:
           FromPort: 80
           ToPort: 80
           CidrIp: !Ref MyIP
+        # NoName prevention engine writes to F5 management API (data groups)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.8.0/24
       Tags:
         - Key: Name
           Value: mcropsey-f5-sg
