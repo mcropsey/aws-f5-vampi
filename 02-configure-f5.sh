@@ -159,6 +159,9 @@ hd "Routes"
 ensure "list net route to-vampi" \
        "create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1" \
        "Route to VAmPI subnet 10.0.1.0/24 via 10.0.6.1"
+ensure "list net route to-k3s" \
+       "create net route to-k3s network 10.0.8.0/24 gw 10.0.6.1" \
+       "Route to k3s subnet 10.0.8.0/24 via 10.0.6.1"
 
 # Return traffic to internet clients needs a default gateway on the external
 # side. DHCP sometimes creates one already — only add it if nothing is there.

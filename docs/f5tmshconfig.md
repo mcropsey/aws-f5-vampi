@@ -88,21 +88,26 @@ create ltm virtual vampi-vs destination 10.0.5.10:80 ip-protocol tcp pool vampi-
 
 ## 9 — Routes
 
-**8a. Static route to the VAmPI subnet.** Required because the F5 internal
-subnet (10.0.6.0/24) has no route to VAmPI (10.0.1.0/24) by default.
+**9a. Static route to the VAmPI subnet.**
 ```bash
 create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1
 ```
 
-To confirm it exists:
+**9b. Static route to the k3s subnet.** Required for F5 clone pool to reach the NoName sensor.
+```bash
+create net route to-k3s network 10.0.8.0/24 gw 10.0.6.1
+```
+
+To confirm:
 ```bash
 list net route to-vampi
+list net route to-k3s
 ```
 > Note: `list net route <name>` returns `"route not found: <name>"` when absent
 > — not the standard `"was not found"` message used for VLANs, self IPs, and
 > other objects. Keep this in mind when scripting existence checks.
 
-**8b. Default gateway.** Required for return traffic to internet clients. DHCP
+**9c. Default gateway.** Required for return traffic to internet clients. DHCP
 on the external interface often creates this for you — check before adding it,
 because a duplicate will be rejected:
 ```bash
@@ -158,6 +163,30 @@ curl http://$F5_VIP_IP/createdb
 | eth1 | 1.1 (external) | 10.0.5.10 | 10.0.5.0/24 |
 | eth2 | 1.2 (internal) | 10.0.6.10 | 10.0.6.0/24 |
 | VAmPI | pool member | `$VAMPI_PRIVATE_IP` | 10.0.1.0/24 |
+| k3s node | NoName sensor target | `$K3S_PRIVATE_IP` | 10.0.8.0/24 |
+
+---
+
+## NoName Remote Engine — F5 Clone Pool
+
+Once the engine is running on the k3s node and shows **connected** in the NoName
+portal, wire F5 traffic mirroring with a clone pool pointed at the reserved sensor IP.
+
+**Reserved sensor IP: `10.0.8.100`** — secondary private IP on the k3s ENI.
+This address is stable across deploys; the F5 clone pool target never needs to change.
+
+For engine deployment steps, see `docs/noname-engine.md`.
+
+```bash
+create ltm pool noname-mirror-pool members add { 10.0.8.100:4789 { address 10.0.8.100 } }
+modify ltm virtual vampi-vs clone-pools add { noname-mirror-pool { bind ingress } }
+save sys config
+```
+
+Verify the clone pool is attached:
+```bash
+list ltm virtual vampi-vs clone-pools
+```
 
 The management interface sits on its own `10.0.7.0/24`, deliberately isolated
 from VAmPI's `10.0.1.0/24`. Sharing a subnet between BIG-IP management and a

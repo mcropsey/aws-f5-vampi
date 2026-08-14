@@ -124,13 +124,20 @@ aws cloudformation describe-stack-events --stack-name mcropsey-lab --region us-e
 | F5 external | `10.0.5.0/24` — eth1, carries the VIP |
 | F5 internal | `10.0.6.0/24` — eth2, pool traffic |
 | F5 management | `10.0.7.0/24` — eth0, **isolated from VAmPI** |
-| Instances | RHEL 9 running VAmPI in podman, m5.xlarge BIG-IP VE |
-| Elastic IPs | VAmPI direct, F5 management, F5 VIP |
+| k3s subnet | `10.0.8.0/24` — us-east-2a, same AZ as F5 |
+| Instances | RHEL 9 (VAmPI in podman), m5.xlarge BIG-IP VE, m5.4xlarge k3s node |
+| Elastic IPs | VAmPI direct, F5 management, F5 VIP, k3s node |
 
 The management subnet being separate is deliberate. An earlier revision put
 eth0 on `10.0.1.0/24` alongside VAmPI; sharing a subnet between BIG-IP
 management and a pool member creates routing ambiguity that is genuinely
 unpleasant to debug.
+
+The k3s node sits on its own `10.0.8.0/24`, isolated from VAmPI, in the same
+AZ as the F5 so mirrored traffic from the F5 clone pool stays intra-AZ.
+A secondary private IP `10.0.8.100` is reserved on the k3s ENI as the stable
+NoName sensor address — give this IP to the NoName team and point the F5
+clone pool at it.
 
 ---
 
@@ -140,10 +147,16 @@ Everything AWS-side is done. The BIG-IP's internal configuration is not — that
 is `02-configure-f5.sh`, or `docs/f5tmshconfig.md` if you are doing it by hand:
 
 1. Set the admin password
-2. Create VLANs, self IPs, **routes**, monitor, pool, virtual server
+2. Create VLANs, self IPs, **routes** (VAmPI + k3s subnets), monitor, pool, virtual server
 
 Note the routes. The original write-up omitted them, and the omission is the
 most common cause of "pool is green but the VIP hangs".
+
+The k3s node installs k3s via cloud-init automatically — no manual steps
+needed. SSH in and run `sudo /usr/local/bin/k3s kubectl get nodes` to confirm
+the node is Ready. NoName remote engine deployment requires an installation
+token from the NoName portal; see `docs/f5tmshconfig.md` for the F5 clone pool
+wiring once the engine is running.
 
 ---
 

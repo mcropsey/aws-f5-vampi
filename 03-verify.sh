@@ -24,14 +24,16 @@ check() { # $1 = label, $2 = command
 }
 
 hd "AWS resources"
-check "CloudFormation stack is CREATE_COMPLETE" \
-  "[[ \$(aws --region $REGION cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].StackStatus' --output text) == CREATE_COMPLETE ]]"
+check "CloudFormation stack is healthy" \
+  "[[ \$(aws --region $REGION cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].StackStatus' --output text) =~ ^(CREATE|UPDATE)_COMPLETE\$ ]]"
 check "VAmPI instance running" \
   "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-rhel9 Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 check "F5 instance running" \
   "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-f5 Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 check "F5 has 3 network interfaces attached" \
   "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-f5 Name=instance-state-name,Values=running --query 'length(Reservations[0].Instances[0].NetworkInterfaces)' --output text) == 3 ]]"
+check "k3s instance running" \
+  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-k3s Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 
 hd "Your public IP still matches the security groups"
 NOW_IP=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '\r\n ')
@@ -65,6 +67,14 @@ if [[ -f "$KEY_FILE" ]]; then
       "admin@${F5_MGMT_IP}" "show ltm pool vampi-pool members" </dev/null 2>&1 | sed 's/^/  /'
 fi
 
+if [[ -f "$KEY_FILE" && -n "${K3S_PUBLIC_IP:-}" ]]; then
+  hd "k3s node"
+  check "k3s service active on ${K3S_PUBLIC_IP}" \
+    "ssh -i $KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes ec2-user@${K3S_PUBLIC_IP} 'sudo systemctl is-active k3s' </dev/null"
+  check "k3s node Ready" \
+    "ssh -i $KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes ec2-user@${K3S_PUBLIC_IP} 'sudo /usr/local/bin/k3s kubectl get nodes --no-headers | grep -q Ready' </dev/null"
+fi
+
 hd "Result"
 printf '  %d passed, %d failed\n\n' "$pass" "$fail"
 if [[ "$fail" -eq 0 ]]; then
@@ -75,8 +85,10 @@ if [[ "$fail" -eq 0 ]]; then
     Swagger UI     http://${VAMPI_PUBLIC_IP}:5000/ui/
     F5 VIP         http://${F5_VIP_IP}/
     F5 TMUI        https://${F5_MGMT_IP}/
+    k3s SSH        ssh -i ${KEY_FILE} ec2-user@${K3S_PUBLIC_IP:-<not deployed>}
+    k3s private    ${K3S_PRIVATE_IP:-<not deployed>}
 
-  Remember: ./99-teardown.sh when you're done — this lab bills by the hour.
+  Remember: ./99-teardown.sh when you're done — this lab bills ~\$1.00-1.10/hr.
 EOF
 else
   echo "  See the failures above. 02-configure-f5.sh is safe to re-run."

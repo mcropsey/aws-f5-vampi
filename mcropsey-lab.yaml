@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  mcropsey Lab — VAmPI + F5 BIG-IP VE
+  mcropsey Lab — VAmPI + F5 BIG-IP VE + k3s (NoName remote engine)
   Correct subnet design: F5 mgmt isolated on 10.0.7.0/24, no overlap with VAmPI (10.0.1.0/24)
+  k3s sensor node on dedicated 10.0.8.0/24, same AZ as F5 for intra-AZ mirroring
 
 # ─── PARAMETERS ──────────────────────────────────────────────────────────────
 Parameters:
@@ -29,6 +30,12 @@ Parameters:
     AllowedValues: [m5.xlarge, m5.2xlarge]
     Description: "EC2 instance type for F5 BIG-IP (m5.xlarge required for PAYG 25Mbps)"
 
+  K3sInstanceType:
+    Type: String
+    Default: m5.4xlarge
+    AllowedValues: [m5.xlarge, m5.2xlarge, m5.4xlarge, m5.8xlarge]
+    Description: "EC2 instance type for k3s node — NoName remote engine needs ≥16 GB RAM"
+
   F5AMI:
     Type: String
     Description: >
@@ -51,7 +58,7 @@ Metadata:
       - Label: { default: "Required — fill these in" }
         Parameters: [MyIP, KeyName, F5AMI]
       - Label: { default: "Instance Types" }
-        Parameters: [VAmPIInstanceType, F5InstanceType]
+        Parameters: [VAmPIInstanceType, F5InstanceType, K3sInstanceType]
       - Label: { default: "AMIs (auto-resolved)" }
         Parameters: [VAmPIAMI]
     ParameterLabels:
@@ -175,6 +182,17 @@ Resources:
         - Key: Name
           Value: mcropsey-f5-mgmt
 
+  # k3s node — NoName remote engine — us-east-2a, same AZ as F5 (intra-AZ mirroring)
+  SubnetK3s:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.8.0/24
+      AvailabilityZone: us-east-2a
+      Tags:
+        - Key: Name
+          Value: mcropsey-k3s
+
   # ── ROUTE TABLE ASSOCIATIONS ───────────────────────────────────────────────
   RTAssocPublicA:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -204,6 +222,12 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref SubnetF5Mgmt
+      RouteTableId: !Ref PublicRT
+
+  RTAssocK3s:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetK3s
       RouteTableId: !Ref PublicRT
 
   # ── SECURITY GROUPS ────────────────────────────────────────────────────────
@@ -259,6 +283,30 @@ Resources:
         - Key: Name
           Value: mcropsey-f5-sg
 
+  K3sSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: mcropsey-k3s-sg
+      GroupDescription: k3s node - NoName remote engine
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH from your workstation
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+        # kubectl / k3s API from your workstation
+        - IpProtocol: tcp
+          FromPort: 6443
+          ToPort: 6443
+          CidrIp: !Ref MyIP
+        # All traffic from F5 internal VLAN — mirrored API traffic to NoName sensor
+        - IpProtocol: "-1"
+          CidrIp: 10.0.6.0/24
+      Tags:
+        - Key: Name
+          Value: mcropsey-k3s-sg
+
   # ── VAmPI EC2 ──────────────────────────────────────────────────────────────
   VAmPIEIP:
     Type: AWS::EC2::EIP
@@ -308,6 +356,49 @@ Resources:
     Properties:
       InstanceId: !Ref VAmPIInstance
       AllocationId: !GetAtt VAmPIEIP.AllocationId
+
+  # ── k3s NODE ───────────────────────────────────────────────────────────────
+  K3sEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: mcropsey-k3s-eip
+
+  K3sInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref VAmPIAMI
+      InstanceType: !Ref K3sInstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetK3s
+      SecurityGroupIds:
+        - !Ref K3sSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: mcropsey-k3s
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          sleep 20
+
+          # Install k3s — disable traefik (not needed for NoName sensor)
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --write-kubeconfig-mode 644" sh -
+
+  K3sEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref K3sInstance
+      AllocationId: !GetAtt K3sEIP.AllocationId
 
   # ── F5 BIG-IP ENIs ─────────────────────────────────────────────────────────
   # eth0 — management ONLY — 10.0.7.0/24 — ISOLATED from VAmPI
@@ -448,6 +539,18 @@ Outputs:
     Description: Use this IP as the F5 pool member address in tmsh
     Value: !Sub "${VAmPIInstance.PrivateIp}:5000"
 
+  K3sPublicIP:
+    Description: k3s node public EIP — SSH and kubectl access
+    Value: !Ref K3sEIP
+
+  K3sPrivateIP:
+    Description: k3s node private IP — F5 clone pool target for NoName sensor
+    Value: !GetAtt K3sInstance.PrivateIp
+
+  K3sSSHCommand:
+    Description: SSH command for k3s node
+    Value: !Sub "ssh -i ~/.ssh/${KeyName}.pem ec2-user@${K3sEIP}"
+
   NextSteps:
     Description: What to do after stack creation
     Value: !Sub |
@@ -456,3 +559,5 @@ Outputs:
       3. Set password: modify auth user admin prompt-for-password
       4. Configure VLANs, self IPs, pool, and virtual server per the lab guide
       5. Pool member address: ${VAmPIInstance.PrivateIp}:5000
+      6. k3s node: ssh -i ~/.ssh/${KeyName}.pem ec2-user@${K3sEIP}
+      7. Install NoName remote engine helm chart on k3s node once token is available

@@ -12,15 +12,21 @@ Four scripts replace the manual CLI + tmsh walkthrough in your existing docs.
 
 ```bash
 cd mcropsey-lab
-./01-deploy-aws.sh      # ~5 min  — CloudFormation stack, VAmPI comes up
+./01-deploy-aws.sh      # ~8 min  — CloudFormation stack, VAmPI + k3s come up
 ./02-configure-f5.sh    # ~10 min — waits for BIG-IP boot, applies all tmsh config
-./03-verify.sh          # ~1 min  — end-to-end checks
+./03-verify.sh          # ~1 min  — end-to-end checks (VIP working, pool green)
 # …lab work…
 ./99-teardown.sh        # deletes everything, releases Elastic IPs
 ```
 
-Total wall time from nothing to a working VIP: roughly 15–20 minutes, most of
+Total wall time from nothing to a working VIP: roughly 20–25 minutes, most of
 it waiting on the BIG-IP to license and provision itself.
+
+**NoName remote engine is a separate post-deployment step** — see
+`docs/noname-engine.md`. It requires manual work in the NoName portal first
+(registering the engine to get credentials), then a Helm deploy on the k3s
+node, then wiring the F5 clone pool. Do not attempt it until `03-verify.sh`
+passes cleanly.
 
 ---
 
@@ -29,10 +35,10 @@ it waiting on the BIG-IP to license and provision itself.
 | File | What it does |
 |---|---|
 | `lab.env` | Region, stack name, key name, instance types. Edit here, not in the scripts. |
-| `mcropsey-lab.yaml` | CloudFormation template — **unchanged** from your original. |
-| `01-deploy-aws.sh` | Preflight → resolve AMIs → create stack → wait for VAmPI → write `lab-outputs.env`. |
-| `02-configure-f5.sh` | SSH to BIG-IP → set password → VLANs, self IPs, routes, monitor, pool, virtual server → verify pool is green. |
-| `03-verify.sh` | Checks AWS state, VAmPI direct, the VIP path, TMUI, and pool health. |
+| `mcropsey-lab.yaml` | CloudFormation template — VAmPI, F5 BIG-IP, and k3s node. |
+| `01-deploy-aws.sh` | Preflight → resolve AMIs → create stack → wait for VAmPI + k3s → write `lab-outputs.env`. |
+| `02-configure-f5.sh` | SSH to BIG-IP → set password → VLANs, self IPs, routes (including k3s subnet), monitor, pool, virtual server → verify pool is green. |
+| `03-verify.sh` | Checks AWS state, VAmPI direct, the VIP path, TMUI, pool health, and k3s node. |
 | `99-teardown.sh` | Deletes the stack, then hunts for orphaned Elastic IPs and security groups. |
 | `lab-outputs.env` | Generated at deploy time. All the live IPs — scripts 02/03/99 read it. |
 
@@ -41,9 +47,12 @@ it waiting on the BIG-IP to license and provision itself.
 | File | Was | Changed |
 |---|---|---|
 | `mcropsey-f5-vampi-setup-v3.docx` | `…setupv2.docx` | Management interface moved to `10.0.7.0/24`; routing section corrected and expanded; stale IPs removed |
-| `f5tmshconfig.md` | same name | Default-gateway step added; IPs now read from `lab-outputs.env` |
+| `f5tmshconfig.md` | same name | Default-gateway step added; IPs now read from `lab-outputs.env`; NoName clone pool section added |
 | `README-cloudformation.md` | `README.md` | RHEL AMI filter fixed; preflight checks and failure diagnostics added |
 | `lab-ips.md` | `currentipinfo.md` | Dead addresses replaced with instructions for reading live ones |
+| `noname-engine.md` | *(new)* | Full NoName remote engine deployment: NGINX ingress, disk sizing, correct `custom_values.yaml` structure, helm install, F5 clone pool wiring |
+| `f5-hsl-integration.md` | *(new)* | F5 HSL over HTTPS integration: complete traffic flow, all F5 objects (pools, VS, iRule), k3s catch-all ingress, nats-jetstream CPU fix, verification and troubleshooting |
+| `f5-prevention-integration.md` | *(new)* | F5 Prevention integration: data groups, Noname-Prevention iRule, dual-iRule attachment order, data group population verification |
 
 ### `originals/` — your five files, byte-for-byte as uploaded
 
@@ -153,9 +162,48 @@ your IP still matches the security group.
 
 ---
 
+## NoName remote engine
+
+**Prerequisite: `03-verify.sh` must pass before starting this.**
+
+The remote engine deployment has three phases — see `docs/noname-engine.md`
+for the full walkthrough:
+
+1. **NoName portal (manual)** — Register the engine in the UI to generate
+   `engine_id`, certificates, and encoded keys. You must do this yourself;
+   these credentials are what populate `custom_values.yaml`.
+
+2. **k3s node (Helm)** — Once you have the credentials, deploy the chart:
+   ```bash
+   ssh -i ~/.ssh/mcropsey-key.pem ec2-user@$K3S_PUBLIC_IP
+   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+   helm upgrade --install akamai-api-security \
+     oci://us-central1-docker.pkg.dev/noname-artifacts/nns-docker/helm/nonamesec \
+     -n akamai-api-security --create-namespace \
+     -f ~/custom_values.yaml --version 'v3.69.0' --timeout 15m
+   ```
+
+3. **F5 clone pool** — After the engine shows connected in the portal:
+   ```bash
+   ssh -i ~/.ssh/mcropsey-key.pem admin@$F5_MGMT_IP
+   # (inside tmsh)
+   create ltm pool noname-mirror-pool members add { 10.0.8.100:4789 { address 10.0.8.100 } }
+   modify ltm virtual vampi-vs clone-pools add { noname-mirror-pool { bind ingress } }
+   save sys config
+   ```
+
+---
+
 ## Cost
 
-Roughly **$0.25–0.35/hour** while running — the `m5.xlarge` for the BIG-IP is
-most of it, plus the PAYG license and three Elastic IPs. About $6–8/day if you
-leave it up. `99-teardown.sh` releases the Elastic IPs too, which are billed
-even when unassociated.
+Roughly **$1.00–1.10/hour** while running — the `m5.4xlarge` for the k3s node
+dominates (~$0.77/hr), followed by the F5 `m5.xlarge` (~$0.19/hr). About
+$24–26/day if you leave it up. `99-teardown.sh` releases all four Elastic IPs,
+which are billed even when unassociated.
+
+| Instance | Type | Cost/hr |
+|---|---|---|
+| F5 BIG-IP | m5.xlarge | ~$0.19 |
+| VAmPI | t3.medium | ~$0.04 |
+| k3s node | m5.4xlarge | ~$0.77 |
+| 4 Elastic IPs | — | ~$0.015 |

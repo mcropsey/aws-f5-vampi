@@ -164,6 +164,7 @@ aws_ cloudformation create-stack \
     "ParameterKey=VAmPIAMI,ParameterValue=$RHEL_AMI" \
     "ParameterKey=VAmPIInstanceType,ParameterValue=$VAMPI_INSTANCE_TYPE" \
     "ParameterKey=F5InstanceType,ParameterValue=$F5_INSTANCE_TYPE" \
+    "ParameterKey=K3sInstanceType,ParameterValue=$K3S_INSTANCE_TYPE" \
   --query 'StackId' --output text
 
 say ""
@@ -200,6 +201,9 @@ out() {
   echo "VAMPI_PRIVATE_IP=\"$(out VAmPIPrivateIP)\""
   echo "F5_MGMT_IP=\"$(out F5MgmtIP)\""
   echo "F5_VIP_IP=\"$(out F5VIPEIP)\""
+  echo "K3S_PUBLIC_IP=\"$(out K3sPublicIP)\""
+  echo "K3S_PRIVATE_IP=\"$(out K3sPrivateIP)\""
+  echo "NONAME_SENSOR_IP=\"10.0.8.100\""
 } > "$OUTPUTS_FILE"
 
 ok "Saved to $OUTPUTS_FILE"
@@ -230,6 +234,29 @@ else
   say  "    sudo tail -50 /var/log/cloud-init-output.log"
 fi
 
+# ── 6. wait for k3s to answer ────────────────────────────────────────────────
+hd "Waiting for k3s node"
+say "cloud-init installs k3s — usually 2–4 minutes after instance launch."
+k3s_up=0
+for i in $(seq 1 24); do
+  if ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+       -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes \
+       "ec2-user@${K3S_PUBLIC_IP}" \
+       "sudo systemctl is-active k3s" </dev/null >/dev/null 2>&1; then
+    k3s_up=1; break
+  fi
+  printf '  … k3s still starting (%d/24)\r' "$i"; sleep 15
+done
+say ""
+if [[ "$k3s_up" == 1 ]]; then
+  ok "k3s is running on ${K3S_PUBLIC_IP}"
+else
+  warn "k3s did not come up within 6 minutes. Debug with:"
+  say  "    ssh -i $KEY_FILE ec2-user@${K3S_PUBLIC_IP}"
+  say  "    sudo systemctl status k3s"
+  say  "    sudo tail -50 /var/log/cloud-init-output.log"
+fi
+
 # ── done ─────────────────────────────────────────────────────────────────────
 hd "AWS side complete"
 cat <<EOF
@@ -239,6 +266,9 @@ cat <<EOF
   F5 TMUI         https://${F5_MGMT_IP}/
   F5 SSH          ssh -i ${KEY_FILE} admin@${F5_MGMT_IP}
   F5 VIP          http://${F5_VIP_IP}/      <- not live until step 02
+  k3s SSH         ssh -i ${KEY_FILE} ec2-user@${K3S_PUBLIC_IP}
+  k3s private     ${K3S_PRIVATE_IP}         <- k3s node primary IP
+  NoName sensor   10.0.8.100                <- reserved secondary IP (give this to NoName)
 
 Next:  ./02-configure-f5.sh
        (BIG-IP needs 5–10 minutes to finish booting; the script waits for it.)

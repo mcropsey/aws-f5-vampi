@@ -16,6 +16,9 @@ VAmPI private   ${VAMPI_PRIVATE_IP}:5000     (F5 pool member)
 VAmPI via VIP   http://${F5_VIP_IP}/
 F5 TMUI         https://${F5_MGMT_IP}/
 F5 SSH          ssh -i ${KEY_FILE} admin@${F5_MGMT_IP}
+k3s SSH         ssh -i ${KEY_FILE} ec2-user@${K3S_PUBLIC_IP}
+k3s private     ${K3S_PRIVATE_IP}            (k3s node primary IP)
+NoName sensor   ${NONAME_SENSOR_IP}          (reserved secondary IP — give this to NoName)
 EOF
 ```
 
@@ -40,9 +43,15 @@ These are set by the template and do not change between deploys:
 | F5 internal self IP | `10.0.6.10` |
 | F5 management | `10.0.7.20` |
 | Virtual server | `10.0.5.10:80` |
+| k3s subnet | `10.0.8.0/24` |
+| k3s node primary IP | `10.0.8.171` (changes each deploy) |
+| **NoName sensor IP** | **`10.0.8.100`** (reserved secondary — does not change) |
 
-The three Elastic IPs (VAmPI direct, F5 management, F5 VIP) and VAmPI's private
-address are assigned at deploy time and differ every run.
+The four Elastic IPs (VAmPI direct, F5 management, F5 VIP, k3s node) and the
+primary private addresses of VAmPI and k3s are assigned at deploy time and
+differ every run. `10.0.8.100` is a reserved secondary IP on the k3s ENI —
+assign this to the NoName sensor service so the F5 clone pool target never
+changes between deploys.
 
 ---
 
