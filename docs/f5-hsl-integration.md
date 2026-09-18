@@ -428,9 +428,16 @@ Verify by size, since the create response is not trustworthy on its own:
 This edits only comments. If NoName support asks you not to modify the file,
 that concern is about the `source_key` and the payload logic, not about `²`.
 
-A known-good copy of the live rule is checked in as
+A known-good copy of the live rule is kept in the bundle root as
 `noname-hsl-irule.backup-20260916-115633.tcl` (384 lines, byte-identical to what
-is on the device as of 2026-09-18).
+is on the device as of 2026-09-18). It is **deliberately not committed** — it
+embeds the integration's `source_key`, and this repository is public. Re-export
+it from the device rather than from git:
+
+```bash
+./f5-api.sh GET /mgmt/tm/ltm/rule/~Common~noname-hsl-https-logger \
+  | jq -r '.apiAnonymous' > noname-hsl-irule.backup-$(date +%Y%m%d-%H%M%S).tcl
+```
 
 ---
 
