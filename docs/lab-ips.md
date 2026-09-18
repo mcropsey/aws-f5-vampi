@@ -43,6 +43,7 @@ These are set by the template and do not change between deploys:
 | F5 internal self IP | `10.0.6.10` |
 | F5 management | `10.0.7.20` |
 | Virtual server | `10.0.5.10:80` |
+| **F5 HSL middle VS** | **`10.0.6.100:80`** (⚠ BIG-IP-internal only — see below) |
 | k3s subnet | `10.0.8.0/24` |
 | k3s node primary IP | `10.0.8.245` (changes each deploy) |
 | **NoName sensor IP** | **`10.0.8.100`** (⚠ *not* reserved — must be added by hand, see below) |
@@ -63,6 +64,18 @@ differ every run.
 > pod→internet packet is silently dropped at the internet gateway. Exact
 > commands, plus the SNAT rule and the systemd unit that restores it at boot,
 > are in `docs/noname-engine.md` → "Sensor IP must not be primary".
+
+> ⚠ **`10.0.6.100` is a BIG-IP virtual server, not an AWS address.** It is the
+> TLS-terminating middle virtual server that wraps the plaintext HSL stream
+> before it is sent to the engine on `10.0.8.100:443`. It exists only in the
+> BIG-IP configuration — there is no ENI, secondary private IP or route for it
+> in AWS, and none is needed, because the traffic both originates and terminates
+> on the BIG-IP and never reaches the AWS fabric. Do not assign it to an
+> interface. See `docs/f5-hsl-integration.md`.
+>
+> Note how close `10.0.6.100` (F5 middle VS) and `10.0.8.100` (engine sensor)
+> look. Transposing them yields a pool that monitors healthy while all telemetry
+> is silently discarded.
 
 ---
 

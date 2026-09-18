@@ -69,7 +69,7 @@ passes cleanly.
 | `README-cloudformation.md` | `README.md` | RHEL AMI filter fixed; preflight checks and failure diagnostics added |
 | `lab-ips.md` | `currentipinfo.md` | Dead addresses replaced with instructions for reading live ones |
 | `noname-engine.md` | *(new)* | Full NoName remote engine deployment: NGINX ingress, disk sizing, correct `custom_values.yaml` structure, helm install, F5 clone pool wiring |
-| `f5-hsl-integration.md` | *(new)* | F5 HSL over HTTPS integration: complete traffic flow, all F5 objects (pools, VS, iRule), k3s catch-all ingress, nats-jetstream CPU fix, verification and troubleshooting |
+| `f5-hsl-integration.md` | *(new)* | F5 HSL over HTTPS integration: complete traffic flow, all F5 objects (both pools, the TLS middle VS, `noname-serverssl` profile, HTTPS monitor, iRule), k3s catch-all ingress, engine sizing, verification and troubleshooting |
 | `f5-prevention-integration.md` | *(new)* | F5 Prevention integration: data groups, Noname-Prevention iRule, dual-iRule attachment order, data group population verification |
 
 ### `originals/` — your five files, byte-for-byte as uploaded
