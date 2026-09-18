@@ -23,17 +23,19 @@ check() { # $1 = label, $2 = command
   fi
 }
 
+printf '%sEnvironment: %s   Stack: %s%s\n' "$c_hd" "$PREFIX" "$STACK_NAME" "$c_0"
+
 hd "AWS resources"
 check "CloudFormation stack is healthy" \
   "[[ \$(aws --region $REGION cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].StackStatus' --output text) =~ ^(CREATE|UPDATE)_COMPLETE\$ ]]"
 check "VAmPI instance running" \
-  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-rhel9 Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
+  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=${PREFIX}-vampi Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 check "F5 instance running" \
-  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-f5 Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
+  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=${PREFIX}-bigip Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 check "F5 has 3 network interfaces attached" \
-  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-f5 Name=instance-state-name,Values=running --query 'length(Reservations[0].Instances[0].NetworkInterfaces)' --output text) == 3 ]]"
+  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=${PREFIX}-bigip Name=instance-state-name,Values=running --query 'length(Reservations[0].Instances[0].NetworkInterfaces)' --output text) == 3 ]]"
 check "k3s instance running" \
-  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=mcropsey-k3s Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
+  "[[ \$(aws --region $REGION ec2 describe-instances --filters Name=tag:Name,Values=${PREFIX}-k3s Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text) == i-* ]]"
 
 hd "Your public IP still matches the security groups"
 NOW_IP=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '\r\n ')
@@ -42,7 +44,7 @@ if [[ "$NOW_IP" == "$MY_IP" ]]; then
 else
   printf '%s✗%s Public IP changed: %s → %s — SG rules will block you.\n' "$c_err" "$c_0" "$MY_IP" "$NOW_IP"
   printf '    Fix with:\n'
-  for sg in mcropsey-sg mcropsey-f5-sg; do
+  for sg in "${PREFIX}-vampi-sg" "${PREFIX}-bigip-sg" "${PREFIX}-k3s-sg"; do
     printf '      aws ec2 --region %s authorize-security-group-ingress --group-name %s --protocol tcp --port <22|80|443|5000> --cidr %s/32\n' "$REGION" "$sg" "$NOW_IP"
   done
   fail=$((fail+1))
@@ -60,11 +62,29 @@ check "/users/v1 returns data through the VIP"         "curl -sf --max-time 10 h
 hd "F5 management"
 check "TMUI at https://${F5_MGMT_IP}/ responds"        "curl -skf --max-time 15 https://${F5_MGMT_IP}/ -o /dev/null"
 
-if [[ -f "$KEY_FILE" ]]; then
-  hd "Pool status (via SSH)"
-  ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes \
-      "admin@${F5_MGMT_IP}" "show ltm pool vampi-pool members" </dev/null 2>&1 | sed 's/^/  /'
+hd "Pool status (via iControl REST)"
+if [[ -n "${F5_ADMIN_PASSWORD:-}" ]]; then
+  TOKEN=$(curl -sk --max-time 20 -X POST "https://${F5_MGMT_IP}/mgmt/shared/authn/login" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg p "$F5_ADMIN_PASSWORD" \
+          '{username:"admin",password:$p,loginProviderName:"tmos"}')" 2>/dev/null \
+    | jq -r '.token.token // empty')
+  if [[ -n "$TOKEN" ]]; then
+    check "Virtual server 'vampi-vs' exists" \
+      "curl -skf --max-time 15 -H 'X-F5-Auth-Token: $TOKEN' https://${F5_MGMT_IP}/mgmt/tm/ltm/virtual/~Common~vampi-vs"
+    curl -sk --max-time 20 -H "X-F5-Auth-Token: $TOKEN" \
+      "https://${F5_MGMT_IP}/mgmt/tm/ltm/pool/~Common~vampi-pool/members/stats" 2>/dev/null \
+      | jq -r '.entries // {} | to_entries[]
+          | "  " + (.value.nestedStats.entries["nodeName"].description // "?")
+            + "  state=" + (.value.nestedStats.entries["status.availabilityState"].description // "?")
+            + "  " + (.value.nestedStats.entries["status.statusReason"].description // "")' 2>/dev/null
+    curl -sk --max-time 10 -X DELETE "https://${F5_MGMT_IP}/mgmt/shared/authz/tokens/${TOKEN}" \
+      -H "X-F5-Auth-Token: ${TOKEN}" >/dev/null 2>&1 || true
+  else
+    printf '  (could not authenticate to the REST API)\n'
+  fi
+else
+  printf '  (set F5_ADMIN_PASSWORD to check pool state over the API)\n'
 fi
 
 if [[ -f "$KEY_FILE" && -n "${K3S_PUBLIC_IP:-}" ]]; then

@@ -7,6 +7,13 @@ Description: >
 # ─── PARAMETERS ──────────────────────────────────────────────────────────────
 Parameters:
 
+  Prefix:
+    Type: String
+    Description: "Name prefix applied to every resource name and tag in this stack"
+    Default: mcropsey-f5
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+    ConstraintDescription: "Lowercase letters, digits and hyphens; must start with a letter"
+
   MyIP:
     Type: String
     Description: "Your public IP in CIDR notation (e.g. 1.2.3.4/32). Run: curl ifconfig.me"
@@ -56,12 +63,13 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: "Required — fill these in" }
-        Parameters: [MyIP, KeyName, F5AMI]
+        Parameters: [Prefix, MyIP, KeyName, F5AMI]
       - Label: { default: "Instance Types" }
         Parameters: [VAmPIInstanceType, F5InstanceType, K3sInstanceType]
       - Label: { default: "AMIs (auto-resolved)" }
         Parameters: [VAmPIAMI]
     ParameterLabels:
+      Prefix: { default: "Resource Name Prefix" }
       MyIP: { default: "Your Public IP (/32)" }
       KeyName: { default: "EC2 Key Pair" }
       F5AMI: { default: "F5 BIG-IP AMI ID" }
@@ -78,14 +86,14 @@ Resources:
       EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: mcropsey-vpc
+          Value: !Sub "${Prefix}-vpc"
 
   IGW:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
-          Value: mcropsey-igw
+          Value: !Sub "${Prefix}-igw"
 
   IGWAttach:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -100,7 +108,7 @@ Resources:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: mcropsey-public-rt
+          Value: !Sub "${Prefix}-public-rt"
 
   PublicRoute:
     Type: AWS::EC2::Route
@@ -119,7 +127,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-public-a
+          Value: !Sub "${Prefix}-public-a"
 
   SubnetPrivateA:
     Type: AWS::EC2::Subnet
@@ -129,7 +137,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-private-a
+          Value: !Sub "${Prefix}-private-a"
 
   SubnetPrivateB:
     Type: AWS::EC2::Subnet
@@ -139,7 +147,7 @@ Resources:
       AvailabilityZone: us-east-2b
       Tags:
         - Key: Name
-          Value: mcropsey-private-b
+          Value: !Sub "${Prefix}-private-b"
 
   SubnetPublicB:
     Type: AWS::EC2::Subnet
@@ -149,7 +157,7 @@ Resources:
       AvailabilityZone: us-east-2b
       Tags:
         - Key: Name
-          Value: mcropsey-public-b
+          Value: !Sub "${Prefix}-public-b"
 
   SubnetF5Ext:
     Type: AWS::EC2::Subnet
@@ -159,7 +167,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-f5-ext
+          Value: !Sub "${Prefix}-ext-subnet"
 
   SubnetF5Int:
     Type: AWS::EC2::Subnet
@@ -169,7 +177,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-f5-int
+          Value: !Sub "${Prefix}-int-subnet"
 
   # CRITICAL: F5 mgmt on its own /24 — NO overlap with VAmPI (10.0.1.0/24)
   SubnetF5Mgmt:
@@ -180,7 +188,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-f5-mgmt
+          Value: !Sub "${Prefix}-mgmt-subnet"
 
   # k3s node — NoName remote engine — us-east-2a, same AZ as F5 (intra-AZ mirroring)
   SubnetK3s:
@@ -191,7 +199,7 @@ Resources:
       AvailabilityZone: us-east-2a
       Tags:
         - Key: Name
-          Value: mcropsey-k3s
+          Value: !Sub "${Prefix}-k3s-subnet"
 
   # ── ROUTE TABLE ASSOCIATIONS ───────────────────────────────────────────────
   RTAssocPublicA:
@@ -234,7 +242,7 @@ Resources:
   VAmPISG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: mcropsey-sg
+      GroupName: !Sub "${Prefix}-vampi-sg"
       GroupDescription: VAmPI lab security group
       VpcId: !Ref VPC
       SecurityGroupIngress:
@@ -255,12 +263,12 @@ Resources:
           CidrIp: 10.0.6.0/24
       Tags:
         - Key: Name
-          Value: mcropsey-sg
+          Value: !Sub "${Prefix}-vampi-sg"
 
   F5SG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: mcropsey-f5-sg
+      GroupName: !Sub "${Prefix}-bigip-sg"
       GroupDescription: F5 BIG-IP VE lab security group
       VpcId: !Ref VPC
       SecurityGroupIngress:
@@ -286,12 +294,12 @@ Resources:
           CidrIp: 10.0.8.0/24
       Tags:
         - Key: Name
-          Value: mcropsey-f5-sg
+          Value: !Sub "${Prefix}-bigip-sg"
 
   K3sSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: mcropsey-k3s-sg
+      GroupName: !Sub "${Prefix}-k3s-sg"
       GroupDescription: k3s node - NoName remote engine
       VpcId: !Ref VPC
       SecurityGroupIngress:
@@ -310,7 +318,7 @@ Resources:
           CidrIp: 10.0.6.0/24
       Tags:
         - Key: Name
-          Value: mcropsey-k3s-sg
+          Value: !Sub "${Prefix}-k3s-sg"
 
   # ── VAmPI EC2 ──────────────────────────────────────────────────────────────
   VAmPIEIP:
@@ -320,7 +328,7 @@ Resources:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: mcropsey-vampi-eip
+          Value: !Sub "${Prefix}-vampi-eip"
 
   VAmPIInstance:
     Type: AWS::EC2::Instance
@@ -333,7 +341,7 @@ Resources:
         - !Ref VAmPISG
       Tags:
         - Key: Name
-          Value: mcropsey-rhel9
+          Value: !Sub "${Prefix}-vampi"
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -370,7 +378,7 @@ Resources:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: mcropsey-k3s-eip
+          Value: !Sub "${Prefix}-k3s-eip"
 
   K3sInstance:
     Type: AWS::EC2::Instance
@@ -389,15 +397,21 @@ Resources:
             DeleteOnTermination: true
       Tags:
         - Key: Name
-          Value: mcropsey-k3s
+          Value: !Sub "${Prefix}-k3s"
       UserData:
-        Fn::Base64: |
+        Fn::Base64: !Sub |
           #!/bin/bash
           set -e
           sleep 20
 
+          # --tls-san adds the Elastic IP to the apiserver serving certificate.
+          # Without it the cert only covers the private IP, so kubectl from a
+          # workstation fails with an x509 SAN mismatch against the public
+          # address. K3sEIP is allocated before this instance, so referencing it
+          # here creates no circular dependency (only K3sEIPAssoc needs both).
+          #
           # Install k3s — disable traefik (not needed for NoName sensor)
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --write-kubeconfig-mode 644" sh -
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --write-kubeconfig-mode 644 --tls-san ${K3sEIP}" sh -
 
   K3sEIPAssoc:
     Type: AWS::EC2::EIPAssociation
@@ -418,7 +432,7 @@ Resources:
       Description: F5 mgmt eth0
       Tags:
         - Key: Name
-          Value: mcropsey-f5-mgmt-eni
+          Value: !Sub "${Prefix}-mgmt-eni"
 
   # eth1 — external VIP — 10.0.5.0/24
   F5ENIExt:
@@ -432,7 +446,7 @@ Resources:
       Description: F5 external eth1
       Tags:
         - Key: Name
-          Value: mcropsey-f5-ext-eni
+          Value: !Sub "${Prefix}-ext-eni"
 
   # eth2 — internal pool — 10.0.6.0/24
   F5ENIInt:
@@ -446,7 +460,7 @@ Resources:
       Description: F5 internal eth2
       Tags:
         - Key: Name
-          Value: mcropsey-f5-int-eni
+          Value: !Sub "${Prefix}-int-eni"
 
   # ── F5 BIG-IP INSTANCE ─────────────────────────────────────────────────────
   F5Instance:
@@ -464,7 +478,7 @@ Resources:
           NetworkInterfaceId: !Ref F5ENIInt
       Tags:
         - Key: Name
-          Value: mcropsey-f5
+          Value: !Sub "${Prefix}-bigip"
 
   # ── F5 ELASTIC IPs ─────────────────────────────────────────────────────────
   F5MgmtEIP:
@@ -474,7 +488,7 @@ Resources:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: mcropsey-f5-mgmt-eip
+          Value: !Sub "${Prefix}-mgmt-eip"
 
   F5MgmtEIPAssoc:
     Type: AWS::EC2::EIPAssociation
@@ -489,7 +503,7 @@ Resources:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: mcropsey-f5-vip-eip
+          Value: !Sub "${Prefix}-vip-eip"
 
   F5VIPEIPAssoc:
     Type: AWS::EC2::EIPAssociation

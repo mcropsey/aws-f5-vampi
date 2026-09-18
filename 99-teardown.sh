@@ -38,12 +38,15 @@ else
 fi
 
 # Elastic IPs are the expensive orphan — AWS bills unassociated EIPs.
-hd "Checking for unassociated Elastic IPs"
+hd "Checking for unassociated Elastic IPs (scoped to ${PREFIX}-*)"
+# Tag filter is applied server-side so nothing outside this environment can
+# ever appear in the release prompt — this is a shared account.
 orphans=$(aws_ ec2 describe-addresses \
+  --filters "Name=tag:Name,Values=${PREFIX}-*" \
   --query 'Addresses[?AssociationId==null].[AllocationId,PublicIp,Tags[?Key==`Name`].Value|[0]]' \
   --output text 2>/dev/null)
 if [[ -n "$orphans" ]]; then
-  warn "Unassociated EIPs found (these still cost money):"
+  warn "Unassociated EIPs tagged ${PREFIX}-* (these still cost money):"
   printf '%s\n' "$orphans" | sed 's/^/  /'
   read -r -p "Release them? [y/N] " reply
   if [[ "$reply" =~ ^[Yy]$ ]]; then
@@ -52,11 +55,11 @@ if [[ -n "$orphans" ]]; then
     done <<< "$orphans"
   fi
 else
-  ok "No unassociated Elastic IPs"
+  ok "No unassociated Elastic IPs tagged ${PREFIX}-*"
 fi
 
 hd "Checking for leftover security groups"
-for sg in mcropsey-sg mcropsey-f5-sg; do
+for sg in "${PREFIX}-vampi-sg" "${PREFIX}-bigip-sg" "${PREFIX}-k3s-sg"; do
   id=$(aws_ ec2 describe-security-groups --filters "Name=group-name,Values=$sg" \
         --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
   if [[ "$id" == sg-* ]]; then

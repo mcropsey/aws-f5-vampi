@@ -1,14 +1,45 @@
-# F5 BIG-IP HSL over HTTPS — NoName Integration
+# F5 BIG-IP HSL — NoName Integration
 
 > **Prerequisite order:**
 > 1. `01-deploy-aws.sh` → `02-configure-f5.sh` → `03-verify.sh` (VIP working)
-> 2. NoName remote engine deployed and **connected** in the portal (`docs/noname-engine.md`)
+> 2. NoName remote engine deployed and **registered** in the portal (`docs/noname-engine.md`)
 > 3. Then this document
+>
+> **Rewritten 2026-09-15 against a working deployment.** The earlier version of
+> this doc described an 8-step chain with a TLS-terminating virtual server, a
+> `nats-jetstream` CPU patch and a manual TMUI paste. None of those are needed.
+> What actually works is **three objects**, and all of the F5 work is REST.
 
-This integration enables the NoName / Akamai API Security engine to capture API
-traffic from the F5 BIG-IP LTM using High-Speed Logging (HSL) over HTTPS. The
-iRule captures every HTTP request/response passing through `vampi-vs` and
-forwards it asynchronously to the engine for analysis.
+This integration lets the NoName / Akamai API Security engine capture API
+traffic from the F5 BIG-IP LTM using High-Speed Logging. The iRule fires on
+every HTTP request/response through `vampi-vs` and forwards a base64 payload
+asynchronously to the engine.
+
+---
+
+## What you actually create
+
+| # | Where | Object | How |
+|---|---|---|---|
+| 1 | k3s | catch-all Ingress `noname-hsl-engine-ingress`, `/engine` → `router:8080` | `kubectl` |
+| 2 | F5 | pool `noname-security-hsl-https` → `10.0.8.100:80`, `tcp` monitor | iControl REST |
+| 3 | F5 | iRule `noname-hsl-https-logger`, attached to `vampi-vs` | iControl REST |
+
+### Why this is shorter than it looks like it should be
+
+**`HSL::open -proto TCP` emits plaintext.** It is a raw TCP log stream — there
+is no TLS on it and no way to add one. The iRule hand-builds an HTTP request
+(`POST /engine?message-format=base64 HTTP/1.1`) and writes it onto that socket.
+
+So pointing the HSL pool at a `:443` backend can never work directly, which is
+the only reason the old doc needed a middle virtual server with a `serverssl`
+profile: something had to wrap the plaintext in TLS. Point the HSL pool at the
+ingress's **port 80** instead and both the virtual server and the second pool
+disappear.
+
+**Trade-off:** telemetry now crosses the VPC between `10.0.5.0/24` and
+`10.0.8.0/24` as plaintext HTTP. Acceptable for a lab on a private VPC. To
+encrypt it, re-introduce the middle VS (see *Optional: putting TLS back*).
 
 ---
 
@@ -19,65 +50,86 @@ Client
   │
   ▼
 vampi-vs (10.0.5.10:80)
-  │  iRule fires on HTTP_REQUEST / HTTP_RESPONSE
+  │  iRule fires on CLIENT_ACCEPTED / HTTP_REQUEST / HTTP_RESPONSE[_DATA]
   │
-  ▼ HSL::open -proto TCP
-noname-security-hsl-https pool (10.0.5.20:8443)
+  ▼ HSL::open -proto TCP -pool $nn_pool      (plaintext, fire-and-forget)
+noname-security-hsl-https pool → 10.0.8.100:80
   │
-  ▼
-noname-security-engine-https-vs (10.0.5.20:8443)
-  │  HTTP profile client-side, serverssl server-side
-  │  F5 terminates plain TCP from iRule, opens TLS to backend
-  │
-  ▼ HTTPS (TLS)
-noname-security-engine-https-pool (10.0.8.100:443)
-  │
-  ▼
-k3s NGINX ingress (hostNetwork, port 443 on 10.0.8.100)
+  ▼ POST /engine?message-format=base64   Host: 10.0.8.100
+k3s NGINX ingress (hostNetwork, port 80)
   │  catch-all ingress: path /engine → router:8080
   │
-  ▼ HTTP
-router service (10.43.x.x:8080)
+  ▼
+router service :8080
   │
   ▼ NATS
 engine pod → michaelc-lab.nonamesec.com (outbound)
 ```
 
-**Key addresses:**
+**Key addresses** (live values are always in `lab-outputs.env`):
 
 | Object | Address | Notes |
 |---|---|---|
-| F5 external self IP | `10.0.5.10` | Self IP — cannot be used as VS destination |
-| Engine VS (loopback) | `10.0.5.20:8443` | Local VS; HSL connects here |
-| NoName sensor IP | `10.0.8.100:443` | Secondary ENI IP on k3s node; stable across deploys |
-| k3s primary IP | `10.0.8.171` | Node IP |
+| F5 VIP (traffic path) | `10.0.5.10:80` | `vampi-vs`, where the iRule is attached |
+| NoName sensor IP | `10.0.8.100:80` | Secondary IP on the k3s node — see caveat below |
+| k3s node primary IP | `10.0.8.245` | `K3S_PRIVATE_IP` |
+| k3s node public IP | `77.112.67.187` | `K3S_PUBLIC_IP` |
+
+> ⚠ **`10.0.8.100` is not reserved by CloudFormation.** `mcropsey-lab.yaml` has
+> no `NetworkInterfaces` block and never mentions this address; it was added to
+> `eth0` by hand, as a `/32`, plus a SNAT rule. `01-deploy-aws.sh` writes
+> `NONAME_SENSOR_IP="10.0.8.100"` into `lab-outputs.env` regardless, so on a
+> fresh deploy that variable names an address that exists nowhere. See
+> **"Sensor IP must not be primary"** in `docs/noname-engine.md` for the exact
+> commands, and do not skip the `/32` — a `/24` silently blackholes all pod
+> egress.
 
 ---
 
 ## Step 1 — Configure the integration profile (NoName portal — manual)
 
 1. Log into the NoName portal at `https://michaelc-lab.nonamesec.com`
-2. Go to **Settings → Integrations → Traffic Sources → Add Integration**
+2. **Settings → Integrations → Traffic Sources → Add Integration**
 3. Select the **F5** tile
 4. Enter a name, select **HSL**, and select the remote engine
 5. Click **Create**
-6. **Download the ZIP file** — extract it to get `send-to-noname.tcl`
+6. **Download the ZIP** — extract it to get `send-to-noname.tcl`
 
-The ZIP contains the iRule pre-configured with your integration credentials
-(`source_key`, `engine_hostname`, etc.). Do not edit the file.
+The iRule arrives pre-configured with your `source_key` and `engine_hostname`.
+Check that `engine_hostname` matches your sensor IP:
+
+```bash
+grep -n 'engine_hostname\|nn_pool\|engine_url' ~/Downloads/send-to-noname.tcl
+```
+
+Expected:
+```tcl
+set static::nn_..._engine_hostname "10.0.8.100"
+set static::nn_..._engine_url "/engine?message-format=base64"
+set nn_pool noname-security-hsl-https
+```
+
+The `engine_hostname` only becomes the `Host:` header — routing is decided by
+the **pool** (Step 3). The pool name in the iRule is what the F5 object must be
+called; don't rename one without the other.
 
 ---
 
 ## Step 2 — k3s: catch-all ingress for `/engine`
 
-The iRule sends traffic with `Host: 10.0.8.100` (the sensor IP). The existing
-ingress only matches `engine.michaelc-lab.local`, so a catch-all rule is needed.
-k3s v1.36 rejects raw IPs as ingress hosts, making a no-host catch-all the
-correct solution.
+**This step is load-bearing.** Without it the request is a 404 and the
+telemetry is dropped — and nothing on the F5 will tell you, because HSL is
+fire-and-forget. Measured on this deployment: `/engine` returned **404 before**
+the ingress and **200 after**, with identical, healthy F5 iRule statistics in
+both cases.
+
+The chart's own ingress only matches `engine.michaelc-lab.local`, but the iRule
+sends `Host: 10.0.8.100`. `networking.k8s.io/v1` rejects a raw IP in
+`spec.rules[].host`, so a no-host catch-all is the fix rather than a workaround.
 
 ```bash
-ssh -i ~/.ssh/mcropsey-key.pem ec2-user@3.136.119.100
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+ssh -i ~/.ssh/mcropsey-key.pem ec2-user@77.112.67.187
+export KUBECONFIG=$HOME/.kube/config    # or /etc/rancher/k3s/k3s.yaml
 
 kubectl apply -f - <<'EOF'
 apiVersion: networking.k8s.io/v1
@@ -105,268 +157,336 @@ spec:
 EOF
 ```
 
-Verify:
+Verify — and verify with the *exact* request the iRule sends, not a bare GET:
+
 ```bash
 kubectl get ingress -n akamai-api-security
-# noname-hsl-engine-ingress should show HOSTS: *
+# noname-hsl-engine-ingress must show HOSTS: *
+
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST 'http://10.0.8.100/engine?message-format=base64' \
+  -H 'Host: 10.0.8.100' --data 'probe'
+# want: 200   (404 = the catch-all ingress is missing or not matching)
+```
+
+> The k3s security group already allows all protocols from `10.0.6.0/24` (the
+> F5 internal self IP), so no SG change is needed for port 80. Do not open it
+> more widely.
+
+---
+
+## Step 3 — F5: create the HSL pool
+
+One pool, straight at the ingress. `monitor tcp` rather than `http`, because
+`/engine` is POST-only and an HTTP monitor's GET would mark it down.
+
+```bash
+cd ~/Downloads/aws-f5-vampi
+set -a; source .f5-admin-password; set +a
+
+./f5-api.sh POST /mgmt/tm/ltm/pool '{
+  "name": "noname-security-hsl-https",
+  "monitor": "tcp",
+  "members": [{"name": "10.0.8.100:80", "address": "10.0.8.100"}]
+}'
+```
+
+Confirm by re-reading it — see the `f5-api.sh` caveat in *Gotchas*:
+
+```bash
+./f5-api.sh GET '/mgmt/tm/ltm/pool/~Common~noname-security-hsl-https/members' \
+  | jq -r '.items[] | "\(.name) \(.state) \(.session)"'
+# want: 10.0.8.100:80 up monitor-enabled
 ```
 
 ---
 
-## Step 3 — k3s: fix nats-jetstream CPU scheduling
+## Step 4 — F5: upload the iRule (REST, no TMUI needed)
 
-The chart's default `nats-jetstream` CPU request is **5 cores**. Combined with
-`heavy-engine` (7 cores) and other pods, this exceeds the node's 16 allocatable
-cores and leaves nats-jetstream `Pending`. The router depends on NATS and will
-crash-loop until it's up.
+The old doc sent you to the browser here. That isn't necessary — the 384-line
+iRule with all seven `proc` definitions uploads cleanly through
+`/mgmt/tm/ltm/rule` using the `apiAnonymous` field.
 
-```bash
-kubectl patch statefulset nats-jetstream -n akamai-api-security --type='json' \
-  -p='[
-    {"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"1"},
-    {"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"2"}
-  ]'
+**One catch.** The vendor file contains non-ASCII characters — `²`, in
+`O(n²)`-style comments. BIG-IP's TCL parser rejects the whole script with a
+message that points at the wrong place entirely:
+
+```
+can't parse TCL script beginning with ... when HTTP_REQUEST {
 ```
 
-Verify all pods are running:
+That error names an event handler hundreds of lines away from the real problem,
+so it reads like a `proc`/brace issue. It isn't. Strip the non-ASCII:
+
 ```bash
-kubectl get pods -n akamai-api-security
-# All should show Running/Ready — especially nats-jetstream-0 and router-*
+python3 - <<'PY'
+import json
+src = open('/Users/mcropsey/Downloads/send-to-noname.tcl', encoding='utf-8').read()
+src = src.replace('²', '^2')                       # O(n²) -> O(n^2)
+src = src.encode('ascii', 'replace').decode('ascii')    # catch any others
+open('/tmp/irule.json', 'w').write(json.dumps(
+    {"name": "noname-hsl-https-logger", "apiAnonymous": src}))
+print(len(src), 'bytes,', 'non-ascii:', any(ord(c) > 127 for c in src))
+PY
+
+./f5-api.sh POST /mgmt/tm/ltm/rule "$(cat /tmp/irule.json)"
 ```
+
+Verify by size, since the create response is not trustworthy on its own:
+
+```bash
+./f5-api.sh GET /mgmt/tm/ltm/rule/~Common~noname-hsl-https-logger \
+  | jq -r '.apiAnonymous | length'
+# want: ~16700
+```
+
+This edits only comments. If NoName support asks you not to modify the file,
+that concern is about the `source_key` and the payload logic, not about `²`.
 
 ---
 
-## Step 4 — F5: create engine pool
+## Step 5 — F5: attach the iRule to `vampi-vs`
 
-Pool pointing at the NoName sensor IP on the k3s node. Using a `tcp` monitor
-(not `https`) because the NGINX ingress `/engine` path returns 200 but the
-endpoint is POST-only — a `tcp` check confirms the port is open without
-relying on HTTP response content.
+`PATCH` replaces the whole `rules` array, so read it first and include anything
+already there.
 
 ```bash
-ssh -i ~/.ssh/mcropsey-key.pem admin@$F5_MGMT_IP
+./f5-api.sh GET /mgmt/tm/ltm/virtual/~Common~vampi-vs | jq '.rules'
 
-create ltm pool noname-security-engine-https-pool {
-    monitor tcp
-    members add { 10.0.8.100:443 { address 10.0.8.100 } }
-}
+./f5-api.sh PATCH /mgmt/tm/ltm/virtual/~Common~vampi-vs \
+  '{"rules":["/Common/noname-hsl-https-logger"]}'
+
+./f5-api.sh POST /mgmt/tm/sys/config '{"command":"save"}'
 ```
-
----
-
-## Step 5 — F5: create engine virtual server
-
-This VS is the HTTPS proxy. The iRule never connects here directly — it goes
-through the HSL pool (Step 6). The VS receives plain TCP from the HSL pool,
-applies the `serverssl` profile to open TLS to the backend engine pool, and
-proxies the HTTP payload through.
-
-The destination `10.0.5.20:8443` is in the external subnet (`10.0.5.0/24`) but
-is **not** a self IP (`10.0.5.10`), so BIG-IP accepts it as a VS address.
-
-```bash
-create ltm virtual noname-security-engine-https-vs {
-    destination 10.0.5.20:8443
-    ip-protocol tcp
-    pool noname-security-engine-https-pool
-    profiles add {
-        http { }
-        serverssl { context serverside }
-    }
-    source-address-translation { type automap }
-}
-```
-
----
-
-## Step 6 — F5: create HSL pool
-
-This is what the iRule's `HSL::open` connects to. It points at the engine VS
-created in Step 5. The `tcp_half_open` monitor checks TCP reachability without
-completing a full handshake.
-
-```bash
-create ltm pool noname-security-hsl-https {
-    monitor tcp_half_open
-    members add { 10.0.5.20:8443 { address 10.0.5.20 } }
-}
-```
-
----
-
-## Step 7 — F5: upload iRule (TMUI — manual)
-
-The iRule contains multi-line TCL with `proc` definitions that are difficult to
-create via tmsh command line. Use the browser UI:
-
-1. Go to `https://<F5_MGMT_IP>`
-2. **Local Traffic → iRules → iRule List → Create**
-3. Set **Name** to `noname-hsl-https-logger`
-4. Paste the full contents of `send-to-noname.tcl` into **Definition**
-5. Click **Finished**
-
-> The iRule file comes from the ZIP downloaded in Step 1. It is pre-configured
-> with your integration credentials — do not edit it unless instructed by the
-> NoName team.
-
-**Known issue with iRule versions before 4.0.0:** If the iRule contains the
-line `set nn_hsl [HSL::open -proto TCP -pool noname-security-hsl-https]`,
-change it to:
-```tcl
-set nn_pool noname-security-hsl-https
-set nn_hsl [HSL::open -proto TCP -pool $nn_pool]
-```
-
----
-
-## Step 8 — F5: attach iRule to vampi-vs
-
-```bash
-modify ltm virtual vampi-vs rules { /Common/noname-hsl-https-logger }
-save sys config
-```
-
-> **Note:** This replaces the rules list. If `vampi-vs` had existing iRules,
-> list them first (`list ltm virtual vampi-vs rules`) and include them all in
-> the `rules { }` block.
 
 ---
 
 ## Verification
 
-### F5 — iRule is firing
-
-```bash
-show ltm rule noname-hsl-https-logger
-```
-
-Look for **Executions Total** incrementing on `HTTP_REQUEST` and
-`HTTP_RESPONSE` events. Zero failures means HSL connections are succeeding.
-
-### F5 — pools are green
-
-```bash
-show ltm pool noname-security-engine-https-pool members
-show ltm pool noname-security-hsl-https members
-```
-
-Both should show `Availability: available`.
-
-### k3s — router is receiving and pushing traffic
-
-```bash
-kubectl logs -n akamai-api-security -l app=router --tail=20
-```
-
-Look for telemetry like:
-```
-"total_messages_pushed_to_ingest": N
-"pushed_to_nats": N
-```
-
-Where N matches (roughly) the iRule execution count. Traffic is flowing
-end-to-end when these numbers are non-zero and incrementing.
-
-### NoName portal
-
-The integration connector status changes from **pending** to **online** once
-the engine processes traffic and sends a heartbeat to the management plane.
-This can take 1–2 minutes after the first traffic flows. Generate a few
-requests to the VIP to trigger it:
+Generate traffic first — the engine has nothing to report until something flows:
 
 ```bash
 source lab-outputs.env
-curl http://$F5_VIP_IP/
-curl http://$F5_VIP_IP/users/v1
-curl http://$F5_VIP_IP/createdb
+for p in / /users/v1 /createdb /books/v1; do
+  curl -s -o /dev/null -w "$p %{http_code}\n" "http://$F5_VIP_IP$p"
+done
 ```
+
+### 1. F5 — the iRule is firing
+
+```bash
+./f5-api.sh GET /mgmt/tm/ltm/rule/~Common~noname-hsl-https-logger/stats \
+  | jq -r '.entries[].nestedStats.entries
+           | "\(.eventType.description) exec=\(.totalExecutions.value) fail=\(.failures.value) err=\(.aborts.value)"'
+```
+
+Expected shape after four requests (counters are cumulative — what matters is
+that they track your request count and that `fail`/`err` stay at 0):
+
+```
+CLIENT_ACCEPTED     exec=4  fail=0  err=0
+HTTP_REQUEST        exec=4  fail=0  err=0
+HTTP_REQUEST_DATA   exec=0  fail=0  err=0
+HTTP_RESPONSE       exec=4  fail=0  err=0
+HTTP_RESPONSE_DATA  exec=4  fail=0  err=0
+RULE_INIT           exec=2  fail=0  err=0
+```
+
+`HTTP_REQUEST_DATA exec=0` is normal — that event only fires when a request has
+a body to collect, and plain `GET`s have none. `RULE_INIT` sits at 2 because it
+runs once per TMM, not once per request.
+
+**Do not stop here.** These counters stay clean even when every payload is
+being 404'd or blackholed — HSL never reports back. This proves the iRule runs,
+nothing more.
+
+### 2. F5 — pool is up
+
+```bash
+./f5-api.sh GET '/mgmt/tm/ltm/pool/~Common~noname-security-hsl-https/members' \
+  | jq -r '.items[] | "\(.name) \(.state)"'
+```
+
+### 3. k3s — the POSTs arrived and were accepted
+
+This is the first check that can actually fail. The source address is the
+proof: `10.0.6.10` is the F5's internal self IP.
+
+```bash
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=100 \
+  | grep '/engine'
+```
+
+Want:
+```
+10.0.6.10 ... "POST /engine?message-format=base64 HTTP/1.1" 200 1
+```
+
+A `404` means Step 2 is missing. No lines at all means the F5 never reached the
+node — check the pool, and check that `10.0.8.100` is actually on `eth0`
+(`ip -4 addr show dev eth0`).
+
+### 4. k3s — the engine processed them
+
+```bash
+kubectl logs -n akamai-api-security -l app=engine --tail=200 \
+  | grep -o '"total_recorded_apis":[^,]*\|"packets_received_from_nats":[^,]*\|"Schema_packets_processed":[^,]*'
+```
+
+The engine emits this block periodically, so you get one line per cycle and the
+values climb. First cycle after the four requests above, then a later one:
+
+```
+"packets_received_from_nats": 6,   "total_recorded_apis": 4,   "Schema_packets_processed": 4
+"packets_received_from_nats": 41,  "total_recorded_apis": 16,  "Schema_packets_processed": 39
+```
+
+`total_recorded_apis` climbing to match the distinct endpoints you have driven
+through the VIP is the end-to-end proof. A single cycle showing
+`"Schema_packets_processed": 0` right after first traffic is not a failure —
+it means that cycle's packets had not been schema-processed yet; check the next
+one.
+
+> The old doc told you to grep the **router** logs for
+> `total_messages_pushed_to_ingest` / `pushed_to_nats`. Those keys do not appear
+> in v3.71.0's router output — the grep comes back empty on a fully working
+> path. Use the engine telemetry above instead.
+
+### 5. NoName portal
+
+The integration connector flips from **pending** to **online** once the engine
+processes traffic and heartbeats to the management plane — 1–2 minutes after
+first traffic. The recorded endpoints then appear under **APIs**.
 
 ---
 
-## Troubleshooting
+## Gotchas
 
-### Connector stays "pending" in portal
+**`f5-api.sh` exits 0 on a 404.** BIG-IP answers a missing object with HTTP 404
+*and a JSON body*, and the script reports that faithfully as success:
 
-1. Check iRule execution count — if zero, iRule is not attached or no traffic
-   has hit the VIP
-2. Check engine pool health (`show ltm pool noname-security-engine-https-pool`)
-   — if down, F5 can't reach `10.0.8.100:443`; verify the k3s route exists on
-   the F5 (`list net route to-k3s`)
-3. Check router logs for NATS connection errors
-4. Check engine logs:
-   ```bash
-   kubectl logs -n akamai-api-security -l app=engine --tail=50
-   ```
-   Look for connection errors to `michaelc-lab.nonamesec.com`
+```json
+{"code": 404, "message": "01020036:3: The requested Pool (...) was not found."}
+```
 
-### nats-jetstream Pending after redeploy
+So `./f5-api.sh GET ... >/dev/null 2>&1 && echo exists` always prints `exists`.
+Parse the body — `jq -e 'has("code") | not'` — never the exit code.
 
-The chart defaults give nats-jetstream a 5-core CPU request. On a fresh
-install, re-apply the patch in Step 3.
+**BIG-IP returns advisory messages shaped like errors.** Virtual-server creates
+emit a `traffic-group-local-only` warning that looks fatal. Always confirm a
+create by re-`GET`ing the object, not by reading the create response.
 
-To persist the fix across helm upgrades, add to `custom_values.yaml`:
+**HSL cannot do TLS, and cannot report failure.** Both consequences matter: the
+backend must be plaintext, and the F5 side of this integration is blind. Every
+real diagnosis happens on the k3s side.
+
+**A clean `curl` is not the same request.** `GET /engine` and
+`POST /engine?message-format=base64` can behave differently through an ingress.
+Probe with the request the iRule actually sends.
+
+---
+
+## Optional: putting TLS back
+
+If this ever needs to leave a trusted network, the plaintext hop is the thing to
+fix. Keep Steps 1, 2, 4, 5 and replace Step 3 with the original three-object
+chain:
+
+```bash
+# backend pool → the ingress on 443
+./f5-api.sh POST /mgmt/tm/ltm/pool '{
+  "name": "noname-security-engine-https-pool", "monitor": "tcp",
+  "members": [{"name": "10.0.8.100:443", "address": "10.0.8.100"}]}'
+
+# middle VS: plaintext in from HSL, TLS out to the ingress.
+# 10.0.5.20 is in the external subnet but is NOT the self IP (10.0.5.10),
+# so BIG-IP accepts it as a virtual-server destination.
+./f5-api.sh POST /mgmt/tm/ltm/virtual '{
+  "name": "noname-security-engine-https-vs",
+  "destination": "10.0.5.20:8443", "ipProtocol": "tcp",
+  "pool": "noname-security-engine-https-pool",
+  "profiles": [{"name":"http"},{"name":"serverssl","context":"serverside"}],
+  "sourceAddressTranslation": {"type":"automap"}}'
+
+# HSL pool now points at the middle VS instead of the node
+./f5-api.sh POST /mgmt/tm/ltm/pool '{
+  "name": "noname-security-hsl-https", "monitor": "tcp_half_open",
+  "members": [{"name": "10.0.5.20:8443", "address": "10.0.5.20"}]}'
+```
+
+The k3s ingress must then terminate TLS on 443 (the chart's nginx runs with
+`hostNetwork: true`, so it already holds both 80 and 443 on the node).
+
+---
+
+## Removed from this doc
+
+**The `nats-jetstream` CPU patch** (old Step 3). It was a symptom fix for
+`Pending` pods, superseded by one supported value:
+
 ```yaml
-# (inside the global or top-level nats_jetstream section - check chart values)
-nats_jetstream:
-  resources:
-    requests:
-      cpu: "1"
-    limits:
-      cpu: "2"
+global:
+  engine:
+    engineSizing: "micro"
 ```
 
-### iRule fires but router shows no messages
+`medium` (the chart default) requests 17300m CPU and cannot fit on a 16 vCPU
+`m5.4xlarge`; `micro` totals 8300m. See `docs/noname-engine.md`. The
+`nats_jetstream:` values key the old doc suggested for persistence **does not
+exist** anywhere in chart v3.71.0 — setting it does nothing.
 
-Verify the catch-all ingress exists and routes correctly:
-```bash
-kubectl get ingress -n akamai-api-security
-# noname-hsl-engine-ingress should show HOSTS: *
+**`global.engine.hostNetwork: "true"`** is *not* required for HSL. It exists to
+make `light-engine` bind UDP 4789 on the node for the **clone-pool / VXLAN**
+integration, which is a *different and mutually exclusive* integration from this
+one. Both target `10.0.8.100`, on different ports, which is an easy way to
+confuse the two docs:
 
-# Test the endpoint directly from the k3s node
-curl -sk https://10.0.8.100/engine -o /dev/null -w '%{http_code}'
-# Should return 200
-```
+| | Port | Needs `hostNetwork` | Doc |
+|---|---|---|---|
+| HSL (this doc) | TCP 80 | no | `f5-hsl-integration.md` |
+| Clone pool / VXLAN | UDP 4789 | **yes** | `noname-engine.md` Phase 3 |
 
-### F5 LTM log errors
+Pick one. It is currently left enabled on this stack — harmless, and it keeps
+the clone-pool option available.
 
-```bash
-tail -50 /var/log/ltm
-# Or via tmsh:
-tmsh -c "show sys log ltm" | tail -20
-```
+**The manual TMUI iRule paste** (old Step 7) — see Step 4.
+
+**The pre-4.0.0 `HSL::open` workaround.** The current `send-to-noname.tcl`
+already uses the `set nn_pool` variable form, so there is nothing to change.
 
 ---
 
 ## Updating the iRule
 
-When a new version of the integration is available:
+Download the new ZIP from the portal, then re-run the Step 4 upload as a `PATCH`
+(same non-ASCII strip — the vendor file still has the `²`):
 
-1. Download the new ZIP from **Settings → Integrations** in the portal
-2. **Local Traffic → iRules → noname-hsl-https-logger**
-3. Replace the Definition content with the new `send-to-noname.tcl`
-4. Click **Update**
+```bash
+./f5-api.sh PATCH /mgmt/tm/ltm/rule/~Common~noname-hsl-https-logger \
+  "$(cat /tmp/irule.json)"
+./f5-api.sh POST /mgmt/tm/sys/config '{"command":"save"}'
+```
 
-No pool, VS, or pool changes are required for an iRule update.
+No pool, ingress or virtual-server changes are needed for an iRule update.
 
 ---
 
 ## Uninstalling
 
 ```bash
-# 1. Remove iRule from vampi-vs
-modify ltm virtual vampi-vs rules none
-save sys config
+cd ~/Downloads/aws-f5-vampi
+set -a; source .f5-admin-password; set +a
 
-# 2. Delete F5 objects (optional)
-delete ltm pool noname-security-hsl-https
-delete ltm virtual noname-security-engine-https-vs
-delete ltm pool noname-security-engine-https-pool
-delete ltm rule noname-hsl-https-logger
-save sys config
+./f5-api.sh PATCH /mgmt/tm/ltm/virtual/~Common~vampi-vs '{"rules":[]}'
+./f5-api.sh DELETE /mgmt/tm/ltm/rule/~Common~noname-hsl-https-logger
+./f5-api.sh DELETE /mgmt/tm/ltm/pool/~Common~noname-security-hsl-https
+./f5-api.sh POST   /mgmt/tm/sys/config '{"command":"save"}'
 
-# 3. Remove k3s catch-all ingress (optional)
+# k3s
 kubectl delete ingress noname-hsl-engine-ingress -n akamai-api-security
 
-# 4. Delete integration profile in NoName portal
-# Settings → Integrations → Traffic Sources → (your integration) → Delete
+# Portal: Settings → Integrations → Traffic Sources → (your integration) → Delete
 ```
+
+Detach the iRule **before** deleting it — BIG-IP refuses to delete a rule that
+is still referenced by a virtual server.

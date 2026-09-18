@@ -1,7 +1,17 @@
-# mcropsey Lab — Automated Deployment
+# mcropsey-f5 Lab — Automated Deployment
 
 VAmPI (intentionally vulnerable API) behind an F5 BIG-IP VE, in AWS `us-east-2`.
 Four scripts replace the manual CLI + tmsh walkthrough in your existing docs.
+
+**Every resource name and tag derives from `PREFIX` in `lab.env` (`mcropsey-f5`).**
+The twin environment — the same VAmPI fronted by an AWS API Gateway instead of
+an F5 — lives in `../aws-api-gw-vampi` under the prefix `mcropsey-aws-gw`. The
+two share nothing: separate VPCs (`10.0.0.0/16` vs `10.2.0.0/16`), separate
+CloudFormation stacks, separate key pairs, separate outputs files. Either can be
+torn down without touching the other.
+
+**BIG-IP configuration is applied over the iControl REST API**, not tmsh. See
+"How the F5 is configured" below.
 
 > ⚠ VAmPI is deliberately vulnerable (OWASP API Top 10). Every security group
 > here is locked to your `/32`. Never widen that to `0.0.0.0/0`.
@@ -11,12 +21,20 @@ Four scripts replace the manual CLI + tmsh walkthrough in your existing docs.
 ## Quick start
 
 ```bash
-cd mcropsey-lab
+cd aws-f5-vampi
 ./01-deploy-aws.sh      # ~8 min  — CloudFormation stack, VAmPI + k3s come up
-./02-configure-f5.sh    # ~10 min — waits for BIG-IP boot, applies all tmsh config
+./02-configure-f5.sh    # ~10 min — waits for BIG-IP REST, applies all config
 ./03-verify.sh          # ~1 min  — end-to-end checks (VIP working, pool green)
 # …lab work…
 ./99-teardown.sh        # deletes everything, releases Elastic IPs
+```
+
+Scripts 02 and 03 need the BIG-IP admin password. Either let them prompt, or
+export it:
+
+```bash
+export F5_ADMIN_PASSWORD='...'      # or: source .f5-admin-password
+./02-configure-f5.sh
 ```
 
 Total wall time from nothing to a working VIP: roughly 20–25 minutes, most of
@@ -34,10 +52,10 @@ passes cleanly.
 
 | File | What it does |
 |---|---|
-| `lab.env` | Region, stack name, key name, instance types. Edit here, not in the scripts. |
+| `lab.env` | Prefix, region, stack name, key name, instance types. Edit here, not in the scripts. |
 | `mcropsey-lab.yaml` | CloudFormation template — VAmPI, F5 BIG-IP, and k3s node. |
 | `01-deploy-aws.sh` | Preflight → resolve AMIs → create stack → wait for VAmPI + k3s → write `lab-outputs.env`. |
-| `02-configure-f5.sh` | SSH to BIG-IP → set password → VLANs, self IPs, routes (including k3s subnet), monitor, pool, virtual server → verify pool is green. |
+| `02-configure-f5.sh` | Wait for iControl REST → bootstrap admin password → auth token → VLANs, self IPs, routes (including k3s subnet), monitor, pool, virtual server → verify pool is green. All config via `/mgmt/tm/*`. |
 | `03-verify.sh` | Checks AWS state, VAmPI direct, the VIP path, TMUI, pool health, and k3s node. |
 | `99-teardown.sh` | Deletes the stack, then hunts for orphaned Elastic IPs and security groups. |
 | `lab-outputs.env` | Generated at deploy time. All the live IPs — scripts 02/03/99 read it. |
@@ -162,6 +180,62 @@ your IP still matches the security group.
 
 ---
 
+## How the F5 is configured
+
+`02-configure-f5.sh` drives the BIG-IP through **iControl REST**
+(`https://<mgmt>/mgmt/tm/...`), not tmsh over SSH.
+
+**Auth.** `POST /mgmt/shared/authn/login` with
+`{"username":"admin","password":"…","loginProviderName":"tmos"}` returns a
+token, which is then sent as `X-F5-Auth-Token` on every subsequent call. The
+token's default 20-minute lifetime is PATCHed to 10 hours up front, because the
+pool-health wait can outlive the default. The token is DELETEd on exit via a
+bash `trap`, so it is not left valid on the device.
+
+**The one SSH step.** REST authentication needs a password, and the BIG-IP AWS
+image ships without one — so the admin password is set once through tmsh over
+SSH, then the script never shells in again. It first probes
+`GET /mgmt/tm/sys/version` with basic auth; if the password already works, the
+SSH bootstrap is skipped entirely, which makes re-runs pure REST.
+
+**Objects created.**
+
+| Object | Endpoint |
+|---|---|
+| hostname, GUI wizard | `PATCH /mgmt/tm/sys/global-settings` |
+| NTP / DNS | `PATCH /mgmt/tm/sys/ntp`, `/mgmt/tm/sys/dns` |
+| VLANs `external`, `internal` | `POST /mgmt/tm/net/vlan` |
+| Self IPs `self-ext`, `self-int` | `POST /mgmt/tm/net/self` |
+| Routes `to-vampi`, `to-k3s`, `default-gw` | `POST /mgmt/tm/net/route` |
+| Monitor `vampi-monitor` | `POST /mgmt/tm/ltm/monitor/http` |
+| Pool `vampi-pool` | `POST /mgmt/tm/ltm/pool` |
+| Virtual server `vampi-vs` | `POST /mgmt/tm/ltm/virtual` |
+| Save to disk | `POST /mgmt/tm/sys/config` `{"command":"save"}` |
+| Pool health | `GET /mgmt/tm/ltm/pool/~Common~vampi-pool/members/stats` |
+
+**Idempotency.** Each object is `GET`ed at its folder-encoded path
+(`~Common~<name>`) before being `POST`ed, and creation is confirmed by
+re-`GET`ing — never by parsing the create response, because BIG-IP returns
+advisory messages that are indistinguishable from errors by shape. Re-running
+the script is safe.
+
+**Driving it by hand.** Same token flow:
+
+```bash
+source .f5-admin-password
+F5_MGMT_IP=$(grep F5_MGMT_IP lab-outputs.env | cut -d'"' -f2)
+
+TOKEN=$(curl -sk -X POST "https://$F5_MGMT_IP/mgmt/shared/authn/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$F5_ADMIN_PASSWORD\",\"loginProviderName\":\"tmos\"}" \
+  | jq -r .token.token)
+
+curl -sk -H "X-F5-Auth-Token: $TOKEN" \
+  "https://$F5_MGMT_IP/mgmt/tm/ltm/pool/~Common~vampi-pool/members/stats" | jq .
+```
+
+---
+
 ## NoName remote engine
 
 **Prerequisite: `03-verify.sh` must pass before starting this.**
@@ -183,13 +257,21 @@ for the full walkthrough:
      -f ~/custom_values.yaml --version 'v3.69.0' --timeout 15m
    ```
 
-3. **F5 clone pool** — After the engine shows connected in the portal:
+3. **F5 clone pool** — After the engine shows connected in the portal, over REST
+   (get `$TOKEN` as shown in "Driving it by hand" above):
    ```bash
-   ssh -i ~/.ssh/mcropsey-key.pem admin@$F5_MGMT_IP
-   # (inside tmsh)
-   create ltm pool noname-mirror-pool members add { 10.0.8.100:4789 { address 10.0.8.100 } }
-   modify ltm virtual vampi-vs clone-pools add { noname-mirror-pool { bind ingress } }
-   save sys config
+   curl -sk -X POST "https://$F5_MGMT_IP/mgmt/tm/ltm/pool" \
+     -H 'Content-Type: application/json' -H "X-F5-Auth-Token: $TOKEN" \
+     -d '{"name":"noname-mirror-pool",
+          "members":[{"name":"10.0.8.100:4789","address":"10.0.8.100"}]}'
+
+   curl -sk -X PATCH "https://$F5_MGMT_IP/mgmt/tm/ltm/virtual/~Common~vampi-vs" \
+     -H 'Content-Type: application/json' -H "X-F5-Auth-Token: $TOKEN" \
+     -d '{"clonePools":[{"name":"/Common/noname-mirror-pool","bind":"ingress"}]}'
+
+   curl -sk -X POST "https://$F5_MGMT_IP/mgmt/tm/sys/config" \
+     -H 'Content-Type: application/json' -H "X-F5-Auth-Token: $TOKEN" \
+     -d '{"command":"save"}'
    ```
 
 ---

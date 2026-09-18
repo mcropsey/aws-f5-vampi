@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 02 — Configure the BIG-IP: VLANs, self IPs, routes, monitor, pool, virtual
-#      server. Everything the lab guide does by hand, over SSH.
+# 02 — Configure the BIG-IP over the iControl REST API
+#      VLANs, self IPs, routes, monitor, pool, virtual server.
 #
 #   ./02-configure-f5.sh
+#   F5_ADMIN_PASSWORD='...' ./02-configure-f5.sh      # non-interactive
 #
-# Safe to re-run: every object is checked before it is created.
+# Everything that configures traffic objects goes through https://<mgmt>/mgmt/tm/*.
+# SSH is used for exactly one thing: setting the admin password on first boot,
+# because REST authentication cannot happen until a password exists. After that
+# the script never shells in again.
+#
+# Safe to re-run: every object is GET-checked before it is POSTed, and existing
+# objects are PATCHed toward the desired state.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -23,7 +30,10 @@ warn() { printf '%s!%s %s\n' "$c_warn" "$c_0" "$*"; }
 die()  { printf '%s✗%s %s\n' "$c_err"  "$c_0" "$*" >&2; exit 1; }
 hd()   { printf '\n%s── %s %s\n' "$c_hd" "$*" "$c_0"; }
 
-[[ -f "$KEY_FILE" ]] || die "Private key not found at $KEY_FILE — cannot SSH to the BIG-IP."
+command -v jq >/dev/null || die "jq is required. brew install jq"
+[[ -f "$KEY_FILE" ]] || die "Private key not found at $KEY_FILE — needed for the one-time password bootstrap."
+
+MGMT="https://${F5_MGMT_IP}"
 
 SSH_OPTS=(-i "$KEY_FILE"
           -o StrictHostKeyChecking=no
@@ -32,176 +42,299 @@ SSH_OPTS=(-i "$KEY_FILE"
           -o ConnectTimeout=10
           -o BatchMode=yes)
 
-# The admin account on the BIG-IP AWS image lands directly in tmsh, so the
-# remote command string IS a tmsh command. Older/modified images land in bash;
-# TMSH_PREFIX absorbs that difference.
-TMSH_PREFIX=""
-tm() { ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "${TMSH_PREFIX}$1" </dev/null 2>&1; }
-# </dev/null on every SSH call is intentional: without it, bash scripts piped
-# into this script (e.g. printf 'pass\npass\n' | ./02-configure-f5.sh) have
-# their stdin consumed by the SSH wait-loop before the 'read' password prompts.
-
-# ── 1. wait for the BIG-IP to finish booting ─────────────────────────────────
-hd "Waiting for BIG-IP at ${F5_MGMT_IP}"
+# ── 1. wait for the management plane ────────────────────────────────────────
+# The REST framework (restjavad/icrd) comes up after tmm, so poll REST itself
+# rather than SSH — that is the interface the rest of this script needs.
+hd "Waiting for BIG-IP REST API at ${F5_MGMT_IP}"
 say "First boot takes 5–10 minutes (licensing + provisioning). Be patient."
 
-booted=0
+rest_up=0
 for i in $(seq 1 60); do
-  if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "show sys version" </dev/null 2>&1); then
-    if printf '%s' "$out" | grep -qi 'BIG-IP\|Sys::Version'; then
-      booted=1; break
-    fi
-    # Shell is bash, not tmsh
-    if out=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "tmsh -c 'show sys version'" </dev/null 2>&1) \
-       && printf '%s' "$out" | grep -qi 'BIG-IP\|Sys::Version'; then
-      TMSH_PREFIX="tmsh -c "; booted=1; break
-    fi
-  fi
-  printf '  … waiting for SSH/tmsh (%d/60)\r' "$i"; sleep 20
+  # /mgmt/shared/echo needs no auth once the framework is listening. A 401 on
+  # /mgmt/tm/sys is just as good a signal: the endpoint exists and is enforcing.
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${MGMT}/mgmt/shared/echo" 2>/dev/null || true)
+  if [[ "$code" == "200" || "$code" == "401" ]]; then rest_up=1; break; fi
+  printf '  … waiting for REST framework (%d/60) [%s]\r' "$i" "${code:-no-response}"; sleep 20
 done
 say ""
-[[ "$booted" == 1 ]] || die "BIG-IP never became reachable over SSH.
+[[ "$rest_up" == 1 ]] || die "BIG-IP REST API never answered on ${MGMT}.
       Check: the instance is running, your public IP still matches the
-      security group rule ($MY_IP/32), and ~10 min have passed since launch."
-ok "BIG-IP is up and tmsh is answering"
+      security group rule (${MY_IP}/32), and ~10 min have passed since launch."
+ok "REST framework is answering"
 
-# Config subsystem (MCP) can still be settling even once tmsh answers.
-for i in $(seq 1 30); do
-  if tm "show sys mcp-state" | grep -qi 'end-platform-id-received\|running'; then break; fi
-  printf '  … waiting for config subsystem (%d/30)\r' "$i"; sleep 10
-done
-say ""
-ok "Config subsystem ready"
-
-# ── 2. admin password ────────────────────────────────────────────────────────
+# ── 2. admin password (the one SSH step) ────────────────────────────────────
+# REST auth needs a password; the AWS image ships without one. Set it via tmsh
+# over SSH once, then everything else is REST.
 hd "Admin password"
-say "Needed for the TMUI web login at https://${F5_MGMT_IP}/"
-say "(SSH keeps using your key either way. Press Enter to skip.)"
-read -r -s -p "New admin password: " PW1; say ""
-if [[ -n "$PW1" ]]; then
-  read -r -s -p "Confirm: " PW2; say ""
+
+if [[ -z "${F5_ADMIN_PASSWORD:-}" ]]; then
+  say "Required for iControl REST authentication and the TMUI login."
+  read -r -s -p "Set admin password: " PW1 </dev/tty; say ""
+  read -r -s -p "Confirm: "           PW2 </dev/tty; say ""
   [[ "$PW1" == "$PW2" ]] || die "Passwords did not match."
-  res=$(tm "modify auth user admin password \"$PW1\"")
-  if printf '%s' "$res" | grep -qi 'error\|fail'; then
-    warn "Password change reported: $res"
-    warn "BIG-IP enforces complexity — try a longer mixed-case password with a digit and symbol."
-  else
-    ok "Admin password set"
-  fi
+  [[ -n "$PW1" ]]        || die "Password cannot be empty — REST auth requires one."
+  F5_ADMIN_PASSWORD="$PW1"
   unset PW1 PW2
 else
-  warn "Skipped — TMUI login will not work until you set it manually."
+  ok "Using F5_ADMIN_PASSWORD from the environment"
 fi
 
-# ── 3. helper: create only if absent ─────────────────────────────────────────
-# $1 = 'list' command that proves existence, $2 = 'create' command, $3 = label
+# Probe /mgmt/tm/sys/version with basic auth.
 #
-# Success is decided by re-listing the object, not by parsing the create
-# output — BIG-IP emits numbered *warnings* (e.g. traffic-group-local-only on
-# a standalone device) that look exactly like numbered errors.
-#
-# Pattern note: most objects return "01020036:3: The requested X was not found."
-# but 'list net route <name>' returns "route not found: <name>" — no "was".
-# Matching 'not found' (not 'was not found') covers both forms.
-exists() {
-  local out
-  out=$(tm "$1" || true)
-  [[ -n "$out" ]] && ! printf '%s' "$out" | grep -qi 'not found\|010200[0-9]'
+# Three outcomes matter and they are easy to confuse:
+#   200 — tm backend is up and the password works
+#   401 — tm backend is up, password is wrong or not yet set
+#   503 — the REST framework is listening but restjavad/icrd behind /mgmt/tm/*
+#         has not finished starting. A timing state, NOT an auth failure, and it
+#         persists for minutes after /mgmt/shared/echo starts answering.
+#   404 — also transient: icrd registers its endpoint tree progressively, so
+#         there is a window where the framework answers but /mgmt/tm/sys/version
+#         is not mounted yet. Observed on 17.1.3.5 between the 503 and 200
+#         phases. Treating it as fatal aborts the script seconds before the
+#         device is ready.
+# Only 200 and 401 are verdicts; everything else means "ask again".
+tm_probe() {
+  local tries="${1:-1}" i code
+  for ((i=1; i<=tries; i++)); do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
+             -u "admin:${F5_ADMIN_PASSWORD}" "${MGMT}/mgmt/tm/sys/version" 2>/dev/null || true)
+    [[ "$code" == "200" || "$code" == "401" ]] && { printf '%s' "$code"; return; }
+    (( i < tries )) && { printf '  … tm backend still starting (%d/%d) [%s]\r' "$i" "$tries" "$code" >&2; sleep 15; }
+  done
+  printf '%s' "$code"
 }
 
+probe=$(tm_probe 1)
+
+if [[ "$probe" == "200" ]]; then
+  ok "Password already accepted by the REST API — skipping SSH bootstrap"
+else
+  say "Bootstrapping the password over SSH (one time only)…"
+  booted=0
+  for i in $(seq 1 30); do
+    if ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "show sys version" </dev/null >/dev/null 2>&1; then
+      booted=1; TMSH_PREFIX=""; break
+    fi
+    if ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" "tmsh -c 'show sys version'" </dev/null >/dev/null 2>&1; then
+      booted=1; TMSH_PREFIX="tmsh -c "; break
+    fi
+    printf '  … waiting for SSH (%d/30)\r' "$i"; sleep 20
+  done
+  say ""
+  [[ "$booted" == 1 ]] || die "Could not SSH to the BIG-IP to set the admin password."
+
+  # Single-quote the password inside the remote tmsh command so shell
+  # metacharacters in it are not reinterpreted on the far side.
+  esc=${F5_ADMIN_PASSWORD//\'/\'\\\'\'}
+  res=$(ssh "${SSH_OPTS[@]}" "admin@${F5_MGMT_IP}" \
+          "${TMSH_PREFIX}modify auth user admin password '${esc}'" </dev/null 2>&1 || true)
+
+  # Wait out restjavad/icrd startup (up to ~10 min) before judging the result.
+  say "Waiting for the /mgmt/tm backend to accept requests…"
+  probe=$(tm_probe 40)
+  say ""
+  case "$probe" in
+    200) ok "Admin password set and accepted by the REST API" ;;
+    401) die "REST auth returns 401 — the password was not accepted.
+      BIG-IP enforces complexity: use a longer mixed-case password with a digit
+      and a symbol, then re-run. BIG-IP said: ${res}" ;;
+    503|404) die "The /mgmt/tm backend still returns ${probe} after ~10 minutes.
+      restjavad/icrd has not finished starting. Check on the device:
+        ssh -i ${KEY_FILE} admin@${F5_MGMT_IP}
+        run util bash -c 'tmsh show sys service restjavad; tail -50 /var/log/restjavad.0.log'
+      Then re-run this script — it is safe to re-run." ;;
+    *)   die "Unexpected HTTP ${probe} from ${MGMT}/mgmt/tm/sys/version.
+      BIG-IP said: ${res}" ;;
+  esac
+fi
+
+# ── 3. auth token ───────────────────────────────────────────────────────────
+# Token auth (not basic) for the config calls: it is what the F5 docs recommend
+# for automation, and it keeps the password out of every subsequent request.
+hd "Authentication token"
+tok_json=$(curl -sk --max-time 20 -X POST "${MGMT}/mgmt/shared/authn/login" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg u admin --arg p "$F5_ADMIN_PASSWORD" \
+        '{username:$u,password:$p,loginProviderName:"tmos"}')" 2>/dev/null || true)
+
+TOKEN=$(printf '%s' "$tok_json" | jq -r '.token.token // empty')
+[[ -n "$TOKEN" ]] || die "Could not obtain an auth token.
+      Response: $(printf '%s' "$tok_json" | head -c 400)"
+ok "Token acquired"
+
+# Default token lifetime is 1200s; the pool-health wait can outlive that.
+curl -sk --max-time 15 -X PATCH "${MGMT}/mgmt/shared/authz/tokens/${TOKEN}" \
+  -H 'Content-Type: application/json' -H "X-F5-Auth-Token: ${TOKEN}" \
+  -d '{"timeout":"36000"}' >/dev/null 2>&1 \
+  && ok "Token lifetime extended to 10h" \
+  || warn "Could not extend token lifetime — continuing on the 20m default"
+
+logout_token() {
+  [[ -n "${TOKEN:-}" ]] && curl -sk --max-time 10 -X DELETE \
+    "${MGMT}/mgmt/shared/authz/tokens/${TOKEN}" \
+    -H "X-F5-Auth-Token: ${TOKEN}" >/dev/null 2>&1 || true
+}
+trap logout_token EXIT
+
+# ── 4. REST helpers ─────────────────────────────────────────────────────────
+# api <METHOD> <PATH> [JSON_BODY]
+#
+# Sets two globals rather than printing the body: API_CODE and API_BODY.
+# Returning the body on stdout would force callers into $(...) command
+# substitution, which runs in a subshell — so the API_CODE assignment would be
+# discarded and callers would silently test a stale code from an earlier call.
+API_CODE=""
+API_BODY=""
+api() {
+  local method="$1" path="$2" body="${3:-}" tmp
+  tmp=$(mktemp)
+  if [[ -n "$body" ]]; then
+    API_CODE=$(curl -sk --max-time 60 -o "$tmp" -w '%{http_code}' -X "$method" "${MGMT}${path}" \
+          -H 'Content-Type: application/json' -H "X-F5-Auth-Token: ${TOKEN}" -d "$body")
+  else
+    API_CODE=$(curl -sk --max-time 60 -o "$tmp" -w '%{http_code}' -X "$method" "${MGMT}${path}" \
+          -H "X-F5-Auth-Token: ${TOKEN}")
+  fi
+  API_BODY=$(cat "$tmp"); rm -f "$tmp"
+}
+
+# Short message out of an F5 error body, for diagnostics.
+api_msg() { printf '%s' "$API_BODY" | jq -r '.message // empty' 2>/dev/null | head -c 300; }
+
+# Object names in URLs are folder-encoded: /Common/foo -> ~Common~foo
+enc() { printf '~Common~%s' "$1"; }
+
+# ensure <collection-path> <name> <json-body> <label>
+# GET first; POST only when absent. Verified by re-GETting, never by parsing
+# the create response — BIG-IP returns advisory messages that read like errors.
 ensure() {
-  local check="$1" create="$2" label="$3" res
-  if exists "$check"; then
+  local coll="$1" name="$2" body="$3" label="$4" post_code post_msg
+  api GET "${coll}/$(enc "$name")"
+  if [[ "$API_CODE" == "200" ]]; then
     warn "$label already exists — leaving it alone"
     return 0
   fi
-  res=$(tm "$create" || true)
-  if exists "$check"; then
-    ok "$label created"
-    [[ -n "${res// /}" ]] && printf '    (BIG-IP said: %s)\n' "$(printf '%s' "$res" | tr '\n' ' ' | cut -c1-160)"
-    return 0
-  fi
-  die "$label failed:
-$res"
+  api POST "$coll" "$body"
+  post_code="$API_CODE"; post_msg="$(api_msg)"
+  # Authoritative check is the re-GET, not the POST code: BIG-IP returns
+  # advisory messages on success that are shaped exactly like errors.
+  api GET "${coll}/$(enc "$name")"
+  [[ "$API_CODE" == "200" ]] && { ok "$label created"; return 0; }
+  die "$label failed (POST HTTP ${post_code}): ${post_msg}"
 }
 
-# ── 4. system basics ─────────────────────────────────────────────────────────
-hd "System settings"
-tm "modify sys global-settings hostname bigip1.mcropsey.lab" >/dev/null && ok "Hostname set"
-tm "modify sys ntp servers add { pool.ntp.org }"              >/dev/null || true
-tm "modify sys dns name-servers add { 8.8.8.8 8.8.4.4 }"      >/dev/null || true
-ok "NTP + DNS set"
-tm "modify sys global-settings gui-setup disabled"            >/dev/null && ok "GUI setup wizard disabled"
+# patch <path> <json-body> <label>
+patch() {
+  local path="$1" body="$2" label="$3"
+  api PATCH "$path" "$body"
+  if [[ "$API_CODE" == "200" ]]; then ok "$label"
+  else warn "$label — HTTP ${API_CODE}: $(api_msg)"
+  fi
+}
 
-# ── 5. VLANs ─────────────────────────────────────────────────────────────────
+# ── 5. system basics ────────────────────────────────────────────────────────
+hd "System settings"
+patch /mgmt/tm/sys/global-settings \
+      "$(jq -nc --arg h "bigip1.${PREFIX}.lab" '{hostname:$h,guiSetup:"disabled"}')" \
+      "Hostname set to bigip1.${PREFIX}.lab, setup wizard disabled"
+patch /mgmt/tm/sys/ntp '{"servers":["pool.ntp.org"]}'            "NTP server set"
+patch /mgmt/tm/sys/dns '{"nameServers":["8.8.8.8","8.8.4.4"]}'   "DNS resolvers set"
+
+# ── 6. VLANs ────────────────────────────────────────────────────────────────
 # eth1 -> interface 1.1 (external, 10.0.5.0/24)
 # eth2 -> interface 1.2 (internal, 10.0.6.0/24)
 hd "VLANs"
-ensure "list net vlan external" \
-       "create net vlan external interfaces add { 1.1 { untagged } }" \
-       "VLAN 'external' (1.1 / eth1)"
-ensure "list net vlan internal" \
-       "create net vlan internal interfaces add { 1.2 { untagged } }" \
-       "VLAN 'internal' (1.2 / eth2)"
+ensure /mgmt/tm/net/vlan external \
+  '{"name":"external","interfaces":[{"name":"1.1","untagged":true}]}' \
+  "VLAN 'external' (1.1 / eth1)"
+ensure /mgmt/tm/net/vlan internal \
+  '{"name":"internal","interfaces":[{"name":"1.2","untagged":true}]}' \
+  "VLAN 'internal' (1.2 / eth2)"
 
-# ── 6. Self IPs ──────────────────────────────────────────────────────────────
+# ── 7. Self IPs ─────────────────────────────────────────────────────────────
 hd "Self IPs"
-ensure "list net self self-ext" \
-       "create net self self-ext address 10.0.5.10/24 vlan external allow-service none" \
-       "Self IP self-ext 10.0.5.10/24"
-ensure "list net self self-int" \
-       "create net self self-int address 10.0.6.10/24 vlan internal allow-service default" \
-       "Self IP self-int 10.0.6.10/24"
+ensure /mgmt/tm/net/self self-ext \
+  '{"name":"self-ext","address":"10.0.5.10/24","vlan":"external","allowService":"none"}' \
+  "Self IP self-ext 10.0.5.10/24"
+ensure /mgmt/tm/net/self self-int \
+  '{"name":"self-int","address":"10.0.6.10/24","vlan":"internal","allowService":"default"}' \
+  "Self IP self-int 10.0.6.10/24"
 
-# ── 7. Routes ────────────────────────────────────────────────────────────────
-# The F5 internal subnet has no route to VAmPI's subnet by default.
+# ── 8. Routes ───────────────────────────────────────────────────────────────
+# TMM has no route to VAmPI's or the k3s subnet by default — without these the
+# pool member never goes green no matter what else is correct.
 hd "Routes"
-ensure "list net route to-vampi" \
-       "create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1" \
-       "Route to VAmPI subnet 10.0.1.0/24 via 10.0.6.1"
-ensure "list net route to-k3s" \
-       "create net route to-k3s network 10.0.8.0/24 gw 10.0.6.1" \
-       "Route to k3s subnet 10.0.8.0/24 via 10.0.6.1"
+ensure /mgmt/tm/net/route to-vampi \
+  '{"name":"to-vampi","network":"10.0.1.0/24","gw":"10.0.6.1"}' \
+  "Route to VAmPI subnet 10.0.1.0/24 via 10.0.6.1"
+ensure /mgmt/tm/net/route to-k3s \
+  '{"name":"to-k3s","network":"10.0.8.0/24","gw":"10.0.6.1"}' \
+  "Route to k3s subnet 10.0.8.0/24 via 10.0.6.1"
 
 # Return traffic to internet clients needs a default gateway on the external
-# side. DHCP sometimes creates one already — only add it if nothing is there.
-if tm "list net route" | grep -q 'network default\|0.0.0.0/0'; then
+# side. DHCP sometimes supplies one already — only add it if nothing is there.
+api GET /mgmt/tm/net/route
+if printf '%s' "$API_BODY" | jq -e '.items[]? | select(.network=="default" or .network=="0.0.0.0/0")' >/dev/null 2>&1; then
   ok "Default route already present"
 else
-  ensure "list net route default-gw" \
-         "create net route default-gw network default gw 10.0.5.1" \
-         "Default route via 10.0.5.1 (external subnet gateway)"
+  ensure /mgmt/tm/net/route default-gw \
+    '{"name":"default-gw","network":"default","gw":"10.0.5.1"}' \
+    "Default route via 10.0.5.1 (external subnet gateway)"
 fi
 
-# ── 8. Monitor, pool, virtual server ─────────────────────────────────────────
+# ── 9. Monitor, pool, virtual server ────────────────────────────────────────
 hd "Health monitor"
-ensure "list ltm monitor http vampi-monitor" \
-       "create ltm monitor http vampi-monitor defaults-from http interval 5 timeout 16 send \"GET / HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" recv \"200 OK\"" \
-       "Monitor 'vampi-monitor'"
+ensure /mgmt/tm/ltm/monitor/http vampi-monitor \
+  "$(jq -nc '{
+      name:"vampi-monitor",
+      defaultsFrom:"/Common/http",
+      interval:5, timeout:16,
+      send:"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+      recv:"200 OK"
+    }')" \
+  "Monitor 'vampi-monitor'"
 
 hd "Pool"
 say "Pool member: ${VAMPI_PRIVATE_IP}:5000"
-ensure "list ltm pool vampi-pool" \
-       "create ltm pool vampi-pool monitor vampi-monitor load-balancing-mode round-robin members add { ${VAMPI_PRIVATE_IP}:5000 { address ${VAMPI_PRIVATE_IP} } }" \
-       "Pool 'vampi-pool'"
+ensure /mgmt/tm/ltm/pool vampi-pool \
+  "$(jq -nc --arg m "${VAMPI_PRIVATE_IP}:5000" --arg a "$VAMPI_PRIVATE_IP" '{
+      name:"vampi-pool",
+      monitor:"/Common/vampi-monitor",
+      loadBalancingMode:"round-robin",
+      members:[{name:$m,address:$a}]
+    }')" \
+  "Pool 'vampi-pool'"
 
 hd "Virtual server"
-ensure "list ltm virtual vampi-vs" \
-       "create ltm virtual vampi-vs destination 10.0.5.10:80 ip-protocol tcp profiles add { http { } tcp { } } source-address-translation { type automap } pool vampi-pool vlans-enabled vlans add { external }" \
-       "Virtual server 'vampi-vs' on 10.0.5.10:80"
-say "(A traffic-group-local-only warning here is normal on a standalone lab device.)"
+ensure /mgmt/tm/ltm/virtual vampi-vs \
+  "$(jq -nc '{
+      name:"vampi-vs",
+      destination:"/Common/10.0.5.10:80",
+      ipProtocol:"tcp",
+      profiles:[{name:"http"},{name:"tcp"}],
+      sourceAddressTranslation:{type:"automap"},
+      pool:"/Common/vampi-pool",
+      vlansEnabled:true,
+      vlans:["/Common/external"]
+    }')" \
+  "Virtual server 'vampi-vs' on 10.0.5.10:80"
 
-# ── 9. Save ──────────────────────────────────────────────────────────────────
+# ── 10. Save ────────────────────────────────────────────────────────────────
 hd "Saving configuration"
-tm "save sys config" >/dev/null && ok "Config saved to disk"
+api POST /mgmt/tm/sys/config '{"command":"save"}'
+[[ "$API_CODE" == "200" ]] && ok "Config saved to disk" || warn "Save returned HTTP ${API_CODE}: $(api_msg)"
 
-# ── 10. Verify pool health ───────────────────────────────────────────────────
+# ── 11. Verify pool health ──────────────────────────────────────────────────
 hd "Pool health"
 say "Monitor needs a few seconds to mark the member up…"
+POOL_STATS_PATH="/mgmt/tm/ltm/pool/$(enc vampi-pool)/members/stats"
 green=0
 for i in $(seq 1 12); do
-  status=$(tm "show ltm pool vampi-pool members")
-  if printf '%s' "$status" | grep -qi 'Availability.*: available\|State.*: up'; then
+  api GET "$POOL_STATS_PATH"
+  if printf '%s' "$API_BODY" | jq -e '
+        .entries // {} | to_entries[]
+        | select(.value.nestedStats.entries["status.availabilityState"].description=="available")
+      ' >/dev/null 2>&1; then
     green=1; break
   fi
   printf '  … waiting for member to go green (%d/12)\r' "$i"; sleep 10
@@ -211,23 +344,26 @@ if [[ "$green" == 1 ]]; then
   ok "Pool member ${VAMPI_PRIVATE_IP}:5000 is UP"
 else
   warn "Pool member is not green yet. Current state:"
-  tm "show ltm pool vampi-pool members"
+  api GET "$POOL_STATS_PATH"
+  printf '%s' "$API_BODY" | jq -r '
+    .entries // {} | to_entries[]
+    | "    " + (.value.nestedStats.entries["nodeName"].description // "?")
+      + "  state=" + (.value.nestedStats.entries["status.availabilityState"].description // "?")
+      + "  " + (.value.nestedStats.entries["status.statusReason"].description // "")' 2>/dev/null
   say ""
   warn "Most common causes, in order:"
-  say  "  1. TMM route to VAmPI subnet missing — verify with 'list net route to-vampi'"
-  say  "     If absent: create net route to-vampi network 10.0.1.0/24 gw 10.0.6.1"
-  say  "  2. VAmPI container isn't running   → ssh ec2-user@${VAMPI_PUBLIC_IP}; sudo podman ps"
+  say  "  1. TMM route to VAmPI subnet missing"
+  say  "     curl -sk -H \"X-F5-Auth-Token: \$TOKEN\" ${MGMT}/mgmt/tm/net/route | jq '.items[].name'"
+  say  "  2. VAmPI container isn't running → ssh -i $KEY_FILE ec2-user@${VAMPI_PUBLIC_IP}; sudo podman ps"
   say  "  3. VAmPI SG missing the 10.0.6.0/24 rule on port 5000"
   say  "  4. Container not started with --network host (pasta drops VPC traffic)"
-  say  "  Test the path from the BIG-IP directly:"
-  say  "     ssh -i $KEY_FILE admin@${F5_MGMT_IP}"
-  say  "     run util bash -c 'curl -sv --interface 10.0.6.10 http://${VAMPI_PRIVATE_IP}:5000/'"
 fi
 
 hd "BIG-IP configuration complete"
 cat <<EOF
   TMUI      https://${F5_MGMT_IP}/           (admin / the password you just set)
   VIP       http://${F5_VIP_IP}/
+  REST      ${MGMT}/mgmt/tm/
   SSH       ssh -i ${KEY_FILE} admin@${F5_MGMT_IP}
 
 Next:  ./03-verify.sh

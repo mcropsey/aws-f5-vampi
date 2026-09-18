@@ -135,9 +135,13 @@ unpleasant to debug.
 
 The k3s node sits on its own `10.0.8.0/24`, isolated from VAmPI, in the same
 AZ as the F5 so mirrored traffic from the F5 clone pool stays intra-AZ.
-A secondary private IP `10.0.8.100` is reserved on the k3s ENI as the stable
-NoName sensor address — give this IP to the NoName team and point the F5
-clone pool at it.
+`10.0.8.100` is used by convention as the NoName sensor address, but ⚠ **the
+template does not create it** — there is no `NetworkInterfaces` block on
+`K3sInstance` and the address appears nowhere in `mcropsey-lab.yaml`. It has to
+be added to the node's `eth0` by hand, as a `/32`, after deploy. See
+`docs/noname-engine.md` → "Sensor IP must not be primary" for why the prefix
+length matters (a `/24` silently blackholes all pod egress) and for the
+dispatcher hook plus SNAT unit that make it survive a reboot.
 
 ---
 

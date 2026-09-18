@@ -172,8 +172,12 @@ curl http://$F5_VIP_IP/createdb
 Once the engine is running on the k3s node and shows **connected** in the NoName
 portal, wire F5 traffic mirroring with a clone pool pointed at the reserved sensor IP.
 
-**Reserved sensor IP: `10.0.8.100`** — secondary private IP on the k3s ENI.
-This address is stable across deploys; the F5 clone pool target never needs to change.
+**Sensor IP: `10.0.8.100`** — ⚠ *not* reserved by CloudFormation. It is a
+convention, added to the k3s node's `eth0` by hand as a `/32` (a `/24` breaks all
+pod egress). See `docs/noname-engine.md` → "Sensor IP must not be primary".
+
+Note this clone-pool path and the HSL path in `docs/f5-hsl-integration.md` are
+**mutually exclusive**; the lab currently runs HSL.
 
 For engine deployment steps, see `docs/noname-engine.md`.
 

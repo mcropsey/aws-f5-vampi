@@ -18,7 +18,7 @@ F5 TMUI         https://${F5_MGMT_IP}/
 F5 SSH          ssh -i ${KEY_FILE} admin@${F5_MGMT_IP}
 k3s SSH         ssh -i ${KEY_FILE} ec2-user@${K3S_PUBLIC_IP}
 k3s private     ${K3S_PRIVATE_IP}            (k3s node primary IP)
-NoName sensor   ${NONAME_SENSOR_IP}          (reserved secondary IP — give this to NoName)
+NoName sensor   ${NONAME_SENSOR_IP}          (convention only — add by hand as a /32)
 EOF
 ```
 
@@ -44,14 +44,25 @@ These are set by the template and do not change between deploys:
 | F5 management | `10.0.7.20` |
 | Virtual server | `10.0.5.10:80` |
 | k3s subnet | `10.0.8.0/24` |
-| k3s node primary IP | `10.0.8.171` (changes each deploy) |
-| **NoName sensor IP** | **`10.0.8.100`** (reserved secondary — does not change) |
+| k3s node primary IP | `10.0.8.245` (changes each deploy) |
+| **NoName sensor IP** | **`10.0.8.100`** (⚠ *not* reserved — must be added by hand, see below) |
 
 The four Elastic IPs (VAmPI direct, F5 management, F5 VIP, k3s node) and the
 primary private addresses of VAmPI and k3s are assigned at deploy time and
-differ every run. `10.0.8.100` is a reserved secondary IP on the k3s ENI —
-assign this to the NoName sensor service so the F5 clone pool target never
-changes between deploys.
+differ every run.
+
+> ⚠ **`10.0.8.100` is a convention, not a reservation.** `mcropsey-lab.yaml` has
+> no `NetworkInterfaces` block and never mentions this address, so CloudFormation
+> does not create it — it was added to the k3s node's `eth0` by hand. It is
+> "stable across deploys" only in the sense that the *convention* is stable;
+> after a fresh deploy nothing is listening on it until you add it.
+>
+> Add it as a **`/32`**, never a `/24`: as a `/24` it becomes the primary address
+> of `10.0.8.0/24`, flannel then SNATs all pod egress to it, and since the
+> Elastic IP is associated only with the node's primary private IP, every
+> pod→internet packet is silently dropped at the internet gateway. Exact
+> commands, plus the SNAT rule and the systemd unit that restores it at boot,
+> are in `docs/noname-engine.md` → "Sensor IP must not be primary".
 
 ---
 
